@@ -1,0 +1,99 @@
+"""Client helpers for interacting with SonarQube's REST API."""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
+
+import requests
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class SonarIssue:
+    """Minimal representation of a SonarQube issue."""
+
+    key: str
+    rule: str
+    severity: str
+    component: str
+    message: str
+    line: Optional[int]
+    status: str
+    effort: Optional[str]
+    type: Optional[str]
+
+
+class SonarQubeClient:
+    """Thin wrapper around SonarQube's issue search API."""
+
+    def __init__(self, host_url: Optional[str] = None, token: Optional[str] = None, project_key: Optional[str] = None) -> None:
+        self.host_url = host_url or os.getenv("SONARQUBE_URL")
+        self.token = token or os.getenv("SONARQUBE_TOKEN")
+        self.project_key = project_key or os.getenv("SONAR_PROJECT_KEY")
+        if not self.host_url:
+            raise ValueError("SONARQUBE_URL is required")
+        if not self.token:
+            raise ValueError("SONARQUBE_TOKEN is required")
+        if not self.project_key:
+            raise ValueError("SONAR_PROJECT_KEY is required")
+        self._session = requests.Session()
+        self._session.auth = (self.token, "")
+
+    def _url(self, path: str) -> str:
+        return f"{self.host_url.rstrip('/')}{path}" if path.startswith("/") else f"{self.host_url.rstrip('/')}/{path}"
+
+    def search_issues(self, severities: Iterable[str] | None = None, statuses: Iterable[str] | None = None) -> List[SonarIssue]:
+        """Fetch open issues for the configured project."""
+        params = {
+            "componentKeys": self.project_key,
+            "p": 1,
+            "ps": 500,
+        }
+        if severities:
+            params["severities"] = ",".join(severities)
+        if statuses:
+            params["statuses"] = ",".join(statuses)
+        issues: List[SonarIssue] = []
+        while True:
+            LOGGER.debug("Fetching Sonar issues page %s", params["p"])
+            resp = self._session.get(self._url("/api/issues/search"), params=params, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            raw_issues = payload.get("issues", [])
+            for entry in raw_issues:
+                issues.append(
+                    SonarIssue(
+                        key=entry.get("key", ""),
+                        rule=entry.get("rule", ""),
+                        severity=entry.get("severity", "UNKNOWN"),
+                        component=entry.get("component", ""),
+                        message=entry.get("message", ""),
+                        line=(entry.get("textRange") or {}).get("startLine"),
+                        status=entry.get("status", "UNKNOWN"),
+                        effort=entry.get("effort"),
+                        type=entry.get("type"),
+                    )
+                )
+            paging = payload.get("paging", {})
+            page_index = paging.get("pageIndex", params["p"])  # type: ignore[arg-type]
+            page_size = paging.get("pageSize", len(raw_issues))
+            total = paging.get("total", len(raw_issues))
+            fetched = page_index * page_size
+            if fetched >= total or not raw_issues:
+                break
+            params["p"] += 1
+        LOGGER.info("Fetched %d Sonar issues", len(issues))
+        return issues
+
+
+def format_issue(issue: SonarIssue) -> str:
+    """Readable representation for prompting."""
+    location = f"{issue.component}:{issue.line}" if issue.line else issue.component
+    return (
+        f"[{issue.severity}] {issue.rule} @ {location}\n"
+        f"Status: {issue.status}\n"
+        f"Message: {issue.message}\n"
+    )

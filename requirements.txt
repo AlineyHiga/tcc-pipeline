@@ -1,0 +1,8 @@
+langchain-openai>=0.1.10
+langchain>=0.2.14
+langgraph>=0.0.44
+requests>=2.32.0
+pytest>=8.2.0
+hypothesis>=6.103.0
+python-a2a[openai]>=0.1.0
+llama-cpp-python>=0.2.65
