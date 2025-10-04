@@ -1,99 +1,99 @@
-"""Client helpers for interacting with SonarQube's REST API."""
-from __future__ import annotations
-
-import logging
-import os
-from dataclasses import dataclass
-from typing import Iterable, List, Optional
-
 import requests
-
-LOGGER = logging.getLogger(__name__)
-
+from dataclasses import dataclass
+from typing import List, Optional
+import os
+import html
+import re
 
 @dataclass
 class SonarIssue:
-    """Minimal representation of a SonarQube issue."""
-
     key: str
     rule: str
     severity: str
     component: str
-    message: str
     line: Optional[int]
-    status: str
-    effort: Optional[str]
-    type: Optional[str]
-
+    message: str
+    textRange: Optional[dict] = None
 
 class SonarQubeClient:
-    """Thin wrapper around SonarQube's issue search API."""
-
-    def __init__(self, host_url: Optional[str] = None, token: Optional[str] = None, project_key: Optional[str] = None) -> None:
-        self.host_url = host_url or os.getenv("SONARQUBE_URL")
+    def __init__(self, url: str = None, token: str = None):
+        self.url = (url or os.getenv("SONARQUBE_URL")).rstrip('/')
         self.token = token or os.getenv("SONARQUBE_TOKEN")
-        self.project_key = project_key or os.getenv("SONAR_PROJECT_KEY")
-        if not self.host_url:
-            raise ValueError("SONARQUBE_URL is required")
-        if not self.token:
-            raise ValueError("SONARQUBE_TOKEN is required")
-        if not self.project_key:
-            raise ValueError("SONAR_PROJECT_KEY is required")
-        self._session = requests.Session()
-        self._session.auth = (self.token, "")
+        self.session = requests.Session()
+        self.session.auth = (self.token, '')
 
-    def _url(self, path: str) -> str:
-        return f"{self.host_url.rstrip('/')}{path}" if path.startswith("/") else f"{self.host_url.rstrip('/')}/{path}"
+    def get_issues(self, project_key: str, severities: List[str] = None) -> List[SonarIssue]:
+        return self.search_issues(severities)
 
-    def search_issues(self, severities: Iterable[str] | None = None, statuses: Iterable[str] | None = None) -> List[SonarIssue]:
-        """Fetch open issues for the configured project."""
+    def search_issues(self, severities: List[str] = None) -> List[SonarIssue]:
+        project_key = os.getenv("SONAR_PROJECT_KEY")
         params = {
-            "componentKeys": self.project_key,
-            "p": 1,
-            "ps": 500,
+            'componentKeys': project_key,
+            'resolved': 'false',
+            'ps': 100
         }
         if severities:
-            params["severities"] = ",".join(severities)
-        if statuses:
-            params["statuses"] = ",".join(statuses)
-        issues: List[SonarIssue] = []
-        while True:
-            LOGGER.debug("Fetching Sonar issues page %s", params["p"])
-            resp = self._session.get(self._url("/api/issues/search"), params=params, timeout=30)
-            resp.raise_for_status()
-            payload = resp.json()
-            raw_issues = payload.get("issues", [])
-            for entry in raw_issues:
-                issues.append(
-                    SonarIssue(
-                        key=entry.get("key", ""),
-                        rule=entry.get("rule", ""),
-                        severity=entry.get("severity", "UNKNOWN"),
-                        component=entry.get("component", ""),
-                        message=entry.get("message", ""),
-                        line=(entry.get("textRange") or {}).get("startLine"),
-                        status=entry.get("status", "UNKNOWN"),
-                        effort=entry.get("effort"),
-                        type=entry.get("type"),
-                    )
-                )
-            paging = payload.get("paging", {})
-            page_index = paging.get("pageIndex", params["p"])  # type: ignore[arg-type]
-            page_size = paging.get("pageSize", len(raw_issues))
-            total = paging.get("total", len(raw_issues))
-            fetched = page_index * page_size
-            if fetched >= total or not raw_issues:
-                break
-            params["p"] += 1
-        LOGGER.info("Fetched %d Sonar issues", len(issues))
+            params['severities'] = ','.join(severities)
+        
+        response = self.session.get(f"{self.url}/api/issues/search", params=params)
+        response.raise_for_status()
+        
+        issues = []
+        for issue_data in response.json().get('issues', []):
+            issues.append(SonarIssue(
+                key=issue_data['key'],
+                rule=issue_data['rule'],
+                severity=issue_data['severity'],
+                component=issue_data['component'],
+                line=issue_data.get('line'),
+                message=issue_data['message'],
+                textRange=issue_data.get('textRange')
+            ))
         return issues
 
+    def get_source_code(self, component: str, from_line: int = 1, to_line: int = None) -> str:
+        raw_params = {'key': component}
+        if from_line:
+            raw_params['from'] = from_line
+        if to_line:
+            raw_params['to'] = to_line
+
+        # Prefer raw endpoint to avoid HTML markup
+        raw_resp = self.session.get(f"{self.url}/api/sources/raw", params=raw_params)
+        if raw_resp.status_code == 200 and raw_resp.text:
+            return raw_resp.text
+
+        # Fallback to show endpoint and strip HTML tags if necessary
+        params = {'key': component, 'from': from_line}
+        if to_line:
+            params['to'] = to_line
+
+        response = self.session.get(f"{self.url}/api/sources/show", params=params)
+        response.raise_for_status()
+
+        payload = response.json()
+        if isinstance(payload, dict):
+            raw_sources = payload.get('sources', [])
+        else:
+            raw_sources = payload
+
+        lines = []
+        for entry in raw_sources:
+            if isinstance(entry, dict):
+                line = entry.get('code', '')
+            elif isinstance(entry, (list, tuple)) and entry:
+                line = entry[-1]
+            elif isinstance(entry, str):
+                line = entry
+            else:
+                line = ''
+
+            # Remove HTML tags / classes when Sonar returns highlighted snippets
+            if '<' in line and '>' in line:
+                line = re.sub(r'<[^>]+>', '', line)
+            lines.append(html.unescape(line))
+
+        return '\n'.join(lines)
 
 def format_issue(issue: SonarIssue) -> str:
-    """Readable representation for prompting."""
-    location = f"{issue.component}:{issue.line}" if issue.line else issue.component
-    return (
-        f"[{issue.severity}] {issue.rule} @ {location}\n"
-        f"Status: {issue.status}\n"
-        f"Message: {issue.message}\n"
-    )
+    return f"{issue.key}: {issue.rule} - {issue.message}"

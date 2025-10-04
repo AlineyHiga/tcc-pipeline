@@ -10,7 +10,7 @@ from app.a2a_runtime import Message, Session
 
 from app.a2a import PRAgent, FixerAgent, Issue, RequesterAgent, SessionState, SonarAgent, TesterAgent
 from app.sonarqube_client import SonarIssue, SonarQubeClient, format_issue
-from app.utils import run_sonar_scanner
+from app.utils import Utils
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,7 +80,13 @@ def run_session_for_issue(issue: Issue) -> SessionState:
 def run_pipeline() -> List[SessionState]:
     client = SonarQubeClient()
     LOGGER.info("Executando sonar-scanner inicial")
-    run_sonar_scanner()
+    scan_exit = Utils.run_sonar_scanner()
+    if scan_exit is None:
+        LOGGER.warning("sonar-scanner não encontrado; pulando scan inicial")
+    elif scan_exit != 0:
+        LOGGER.error("sonar-scanner falhou (exit=%d). Abortando pipeline", scan_exit)
+        return []
+    
     issues = client.search_issues(severities=ISSUE_SEVERITIES or None)
     LOGGER.info("%d issue(s) encontradas", len(issues))
     results: List[SessionState] = []
