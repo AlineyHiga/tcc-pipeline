@@ -1,93 +1,230 @@
+"""Orchestrator for the AutoFix SonarQube + A2A pipeline."""
+from __future__ import annotations
+
+import json
+import logging
 import os
+from typing import List
+
 from dotenv import load_dotenv
-from rich import print
-from .sonarqube_client import SonarQubeClient
-from .patcher import Patcher
-from .a2a.requester_agent import RequesterAgent
-from .utils import Utils
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+
+from app.a2a import FixerAgent, Issue, RequesterAgent, State, TesterAgent
+from app.a2a.patcher_tool import apply_patch_node
+from app.sonarqube_client import SonarIssue, SonarQubeClient, format_issue
+from app.utils import create_pull_request, ensure_git_branch, format_issues_for_prompt, git_commit_all, run_sonar_scanner
 
 load_dotenv()
 
-def main():
-    # Configuration
-    sonar_url = os.getenv("SONARQUBE_URL")
-    sonar_token = os.getenv("SONARQUBE_TOKEN")
-    project_key = os.getenv("SONAR_PROJECT_KEY")
-    fixer_endpoint = os.getenv("A2A_FIXER_ENDPOINT")
-    
-    if not all([sonar_url, sonar_token, project_key, fixer_endpoint]):
-        print("[red]Missing required environment variables")
-        return
-    
-    # Run sonar-scanner first to refresh issues
-    print("[blue]Running sonar-scanner to refresh findings...")
-    scan_exit = Utils.run_sonar_scanner()
-    if scan_exit is None:
-        print("[yellow]sonar-scanner not found; skipping initial scan.")
-    elif scan_exit != 0:
-        print(f"[red]sonar-scanner failed (exit={scan_exit}). Aborting pipeline.")
-        return
+LOGGER = logging.getLogger(__name__)
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
-    # Initialize components
-    sonar_client = SonarQubeClient(sonar_url, sonar_token)
-    patcher = Patcher()
-    requester = RequesterAgent(fixer_endpoint)
-    
-    print("[blue]Fetching SonarQube issues...")
+MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "3"))
+ISSUE_SEVERITIES = [s.strip() for s in os.getenv("ISSUE_SEVERITIES", "MAJOR,CRITICAL").split(",") if s.strip()]
+BASE_BRANCH = os.getenv("BASE_BRANCH", "main")
+AUTO_BRANCH_PREFIX = os.getenv("AUTO_BRANCH_PREFIX", "autofix")
+
+
+def sonar_issue_to_issue(issue: SonarIssue) -> Issue:
+    return Issue(
+        key=issue.key,
+        rule=issue.rule,
+        severity=issue.severity,
+        component=issue.component,
+        message=issue.message,
+        line=issue.line,
+    )
+
+
+def append_feedback(state: State, header: str, body: str) -> None:
+    if not body:
+        return
+    entry = f"{header}:\n{body.strip()}"
+    log = state.get("feedback_log", "")
+    state["feedback_log"] = (log + "\n\n" + entry).strip() if log else entry
+    context = state.get("context", "")
+    state["context"] = (context + "\n\n" + entry).strip() if context else entry
+
+
+def requester_node(state: State) -> State:
+    agent = RequesterAgent()
+    return agent.invoke(state)
+
+
+def fixer_node(state: State) -> State:
+    agent = FixerAgent()
+    return agent.invoke(state)
+
+
+def tester_node(state: State) -> State:
+    if state.get("fix_failed"):
+        summary = state.get("fixer_summary", "Falha ao aplicar patch")
+        state.update({
+            "test_passed": False,
+            "test_logs": "Patch não aplicado; testes não executados.",
+            "tester_summary": summary,
+            "fix_failed": False,
+        })
+        return state
+    agent = TesterAgent()
+    return agent.invoke(state)
+
+
+def sonar_node(state: State) -> State:
+    run_sonar_scanner()
+    client = SonarQubeClient()
+    issues = client.search_issues(severities=ISSUE_SEVERITIES or None)
+    issue_key = state["issue"].key
+    remaining = [issue for issue in issues if issue.key == issue_key]
+    if not remaining:
+        state.update({
+            "sonar_passed": True,
+            "sonar_summary": "Issue resolvido segundo SonarQube",
+        })
+    else:
+        formatted = format_issues_for_prompt(
+            {
+                "severity": item.severity,
+                "rule": item.rule,
+                "component": item.component,
+                "line": item.line,
+                "message": item.message,
+            }
+            for item in remaining
+        )
+        state.update({
+            "sonar_passed": False,
+            "sonar_summary": formatted,
+        })
+    return state
+
+
+def maybe_open_pr_node(state: State) -> State:
+    issue = state["issue"]
+    branch_name = state.get("branch") or f"{AUTO_BRANCH_PREFIX}/{issue.key}"
+    ensure_git_branch(branch_name)
+    git_commit_all(f"fix: auto remediation for {issue.key}")
+    state["branch"] = branch_name
     try:
-        issues = sonar_client.get_issues(project_key, severities=["MAJOR", "CRITICAL"])
-    except Exception as e:
-        print(f"[red]Failed to connect to SonarQube: {e}")
-        return
-    
-    if not issues:
-        print("[green]No issues found!")
-        return
-    
-    print(f"[yellow]Found {len(issues)} issues to process")
-    
+        body_lines = [
+            "Correção automática via pipeline AutoFix.",
+            "",
+            f"Issue Sonar: `{issue.key}`",
+            "",
+            "Feedback acumulado:",
+            state.get("feedback_log", "-"),
+            "",
+            "Logs do Tester:",
+            "```",
+            state.get("test_logs", ""),
+            "```",
+        ]
+        pr = create_pull_request(
+            title=f"fix: AutoFix for {issue.key}",
+            body="\n".join(body_lines),
+            head=branch_name,
+            base=BASE_BRANCH,
+        )
+        state["pr_url"] = pr.get("html_url", "")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("Falha ao criar PR: %s", exc)
+    return state
+
+
+def after_patch_router(state: State) -> str:
+    if state.get("fix_failed"):
+        append_feedback(state, "Falha do Fixer", state.get("fixer_summary", ""))
+        attempt = int(state.get("attempt", 1))
+        if attempt >= MAX_ROUNDS:
+            return "end"
+        state["attempt"] = attempt + 1
+        state["fix_failed"] = False
+        return "requester"
+    return "tester"
+
+
+def after_tester_router(state: State) -> str:
+    attempt = int(state.get("attempt", 1))
+    if state.get("test_passed"):
+        return "sonar"
+    append_feedback(state, "Falhas do Tester", state.get("tester_summary", ""))
+    if attempt >= MAX_ROUNDS:
+        return "end"
+    state["attempt"] = attempt + 1
+    return "fixer"
+
+
+def after_sonar_router(state: State) -> str:
+    if state.get("sonar_passed"):
+        return "open_pr"
+    append_feedback(state, "Feedback Sonar", state.get("sonar_summary", ""))
+    attempt = int(state.get("attempt", 1))
+    if attempt >= MAX_ROUNDS:
+        return "end"
+    state["attempt"] = attempt + 1
+    return "fixer"
+
+
+def run_graph_for_issue(issue: Issue) -> State:
+    builder = StateGraph(State)
+    builder.add_node("requester", requester_node)
+    builder.add_node("fixer", fixer_node)
+    builder.add_node("patcher", apply_patch_node)
+    builder.add_node("tester", tester_node)
+    builder.add_node("sonar", sonar_node)
+    builder.add_node("open_pr", maybe_open_pr_node)
+
+    builder.add_edge(START, "requester")
+    builder.add_edge("requester", "fixer")
+    builder.add_edge("fixer", "patcher")
+    builder.add_conditional_edges("patcher", after_patch_router, {
+        "tester": "tester",
+        "requester": "requester",
+        "end": END,
+    })
+    builder.add_conditional_edges("tester", after_tester_router, {
+        "sonar": "sonar",
+        "fixer": "fixer",
+        "end": END,
+    })
+    builder.add_conditional_edges("sonar", after_sonar_router, {
+        "open_pr": "open_pr",
+        "fixer": "fixer",
+        "end": END,
+    })
+    builder.add_edge("open_pr", END)
+
+    graph = builder.compile(checkpointer=MemorySaver())
+    initial_state: State = {"issue": issue, "attempt": 1, "feedback_log": ""}
+    config = {
+        "configurable": {"thread_id": issue.key},
+        "recursion_limit": max(25, MAX_ROUNDS * 10),
+    }
+    final_state: State = graph.invoke(initial_state, config=config)
+    LOGGER.info("Pipeline finalizado para issue %s", issue.key)
+    LOGGER.debug("Estado final: %s", json.dumps({k: v for k, v in final_state.items() if k != "issue"}, ensure_ascii=False, indent=2))
+    return final_state
+
+
+def run_pipeline() -> List[State]:
+    client = SonarQubeClient()
+    LOGGER.info("Executando sonar-scanner inicial")
+    run_sonar_scanner()
+    issues = client.search_issues(severities=ISSUE_SEVERITIES or None)
+    LOGGER.info("%d issue(s) encontradas", len(issues))
+    results: List[State] = []
     for issue in issues:
-        print(f"\n[cyan]Processing issue: {issue.key}")
-        print(f"Rule: {issue.rule}")
-        print(f"Message: {issue.message}")
-        
-        try:
-            # Get source code
-            source_code = sonar_client.get_source_code(issue.component)
-            file_path = issue.component.split(':')[-1]  # Extract file path from component
-            
-            # Request fix from A2A agent
-            print("[yellow]Requesting fix from A2A agent...")
-            diff = requester.request_fix(issue, source_code, file_path)
-            
-            if diff:
-                print("Aplicando patch...\n", diff)
-                if patcher.apply_unified_diff(diff):
-                    code = patcher.run_tests()
-                    if code == 0:
-                        print(f"✅ Patch para {issue.key} passou nos testes. Rodando sonar-scanner...")
-                        sonar_exit = Utils.run_sonar_scanner()
-                        if sonar_exit == 0:
-                            branch_name = f"autofix/{issue.key}"
-                            Utils.create_branch_and_commit(branch_name, f"AutoFix: {issue.key}")
-                            Utils.open_github_pr(
-                                branch_name, 
-                                f"AutoFix: {issue.key}", 
-                                f"Correção automática para issue {issue.key} gerada via A2A."
-                            )
-                        else:
-                            print(f"❌ sonar-scanner falhou para {issue.key}. Encaminhar logs ao Fixer.")
-                    else:
-                        print(f"❌ Patch para {issue.key} falhou nos testes (exit={code}).")
-                        patcher.revert_changes()
-                else:
-                    print(f"❌ Failed to apply patch for {issue.key}")
-            else:
-                print(f"❌ No patch generated for {issue.key}")
-                
-        except Exception as e:
-            print(f"[red]Error processing {issue.key}: {e}")
-            patcher.revert_changes()
+        LOGGER.info("Iniciando fluxo para %s", format_issue(issue).strip().replace("\n", " | "))
+        result = run_graph_for_issue(sonar_issue_to_issue(issue))
+        results.append(result)
+    return results
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        outcomes = run_pipeline()
+        LOGGER.info("Pipeline concluído para %d issue(s)", len(outcomes))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.exception("Falha durante pipeline: %s", exc)
+        raise

@@ -1,64 +1,112 @@
-import subprocess
+
+"""Utility helpers for the AutoFix pipeline."""
+from __future__ import annotations
+
+import json
+import logging
 import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Iterable, Mapping, Optional
+
 import requests
-from rich import print
 
-class Utils:
-    @staticmethod
-    def run_sonar_scanner(project_dir: str = ".") -> int:
-        sonar_url = os.getenv("SONARQUBE_URL")
-        sonar_token = os.getenv("SONARQUBE_TOKEN")
-        project_key = os.getenv("SONAR_PROJECT_KEY")
-        project_name = os.getenv("SONAR_PROJECT_NAME", project_key or "")
-        sonar_sources = os.getenv("SONAR_SOURCES", "src")
+LOGGER = logging.getLogger(__name__)
 
-        if not all([sonar_url, sonar_token, project_key]):
-            print("[red]Missing SONARQUBE_URL, SONARQUBE_TOKEN or SONAR_PROJECT_KEY for sonar-scanner")
-            return 1
 
+def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | Path = ".") -> None:
+    """Execute `sonar-scanner` locally or via the official Docker image."""
+    from dotenv import load_dotenv
+    load_dotenv()
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
+    scanner_path = shutil.which("sonar-scanner")
+    if scanner_path:
+        cmd = [scanner_path]
+    else:
+        LOGGER.info("sonar-scanner not found, falling back to Docker image")
         cmd = [
-            "sonar-scanner",
-            f"-Dsonar.projectKey={project_key}",
-            f"-Dsonar.projectName={project_name}",
-            f"-Dsonar.sources={sonar_sources}",
-            f"-Dsonar.host.url={sonar_url}",
-            f"-Dsonar.login={sonar_token}",
-            f"-Dsonar.projectBaseDir={os.path.abspath(project_dir)}",
+            "docker",
+            "run",
+            "--rm",
+            "--network=host",
+            "-e",
+            f"SONAR_HOST_URL={env.get('SONARQUBE_URL')}",
+            "-e",
+            f"SONAR_TOKEN={env.get('SONARQUBE_TOKEN')}",
+            "-e",
+            f"SONAR_PROJECT_KEY={env.get('SONAR_PROJECT_KEY')}",
+            "-e",
+            f"SONAR_PROJECT_NAME={env.get('SONAR_PROJECT_NAME', env.get('SONAR_PROJECT_KEY'))}",
+            "-e",
+            f"SONAR_SOURCES={env.get('SONAR_SOURCES', 'src')}",
+            "-v",
+            f"{Path(cwd).resolve()}:/usr/src",
+            "sonarsource/sonar-scanner-cli",
         ]
+    LOGGER.info("Project key: %s", env.get('SONAR_PROJECT_KEY'))
+    LOGGER.info("SonarQube URL: %s", env.get('SONARQUBE_URL'))
+    LOGGER.debug("Executing command: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, check=False)
+    if proc.returncode != 0:
+        LOGGER.error("Sonar scanner failed: %s", proc.stderr.decode())
+        raise RuntimeError(proc.stderr.decode())
+    LOGGER.info("Sonar scanner completed successfully")
 
-        sonar_branch = os.getenv("SONAR_BRANCH_NAME")
-        if sonar_branch:
-            cmd.append(f"-Dsonar.branch.name={sonar_branch}")
 
-        print("[blue]Running sonar-scanner with configured connection...")
-        try:
-            result = subprocess.run(cmd, cwd=project_dir)
-            return result.returncode
-        except FileNotFoundError:
-            print("[red]sonar-scanner binary not found. Please install SonarScanner or adjust your PATH.")
-            return None
+def ensure_git_branch(branch_name: str, cwd: str | Path = ".") -> None:
+    """Create or check out the working branch used for the PR."""
+    proc = subprocess.run(["git", "rev-parse", "--verify", branch_name], cwd=str(cwd), capture_output=True, check=False)
+    if proc.returncode == 0:
+        subprocess.run(["git", "checkout", branch_name], cwd=str(cwd), check=True)
+    else:
+        subprocess.run(["git", "checkout", "-b", branch_name], cwd=str(cwd), check=True)
 
-    @staticmethod
-    def create_branch_and_commit(branch_name: str, commit_msg: str, repo_dir: str = ".") -> None:
-        subprocess.run(["git", "checkout", "-b", branch_name], cwd=repo_dir, check=True)
-        subprocess.run(["git", "add", "."], cwd=repo_dir, check=True)
-        subprocess.run(["git", "commit", "-m", commit_msg], cwd=repo_dir, check=True)
-        subprocess.run(["git", "push", "-u", "origin", branch_name], cwd=repo_dir, check=True)
 
-    @staticmethod
-    def open_github_pr(branch_name: str, title: str, body: str = "") -> None:
-        token = os.environ.get("GITHUB_TOKEN")
-        repo = os.environ.get("GITHUB_REPO")  # ex: "user/repo"
-        if not token or not repo:
-            raise ValueError("Configure GITHUB_TOKEN e GITHUB_REPO")
-        
-        url = f"https://api.github.com/repos/{repo}/pulls"
-        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-        payload = {"title": title, "head": branch_name, "base": "main", "body": body}
-        
-        r = requests.post(url, headers=headers, json=payload)
-        if r.status_code == 201:
-            pr_url = r.json().get("html_url")
-            print(f"[green]PR criado com sucesso: {pr_url}")
-        else:
-            print(f"[red]Falha ao criar PR: {r.status_code} {r.text}")
+def git_commit_all(message: str, cwd: str | Path = ".") -> None:
+    subprocess.run(["git", "add", "-A"], cwd=str(cwd), check=True)
+    proc = subprocess.run(["git", "diff", "--cached", "--stat"], cwd=str(cwd), capture_output=True, check=True)
+    if not proc.stdout.strip():
+        LOGGER.info("No changes to commit")
+        return
+    subprocess.run(["git", "commit", "-m", message], cwd=str(cwd), check=True)
+
+
+def create_pull_request(
+    title: str,
+    body: str,
+    head: str,
+    base: str = "main",
+    repository: Optional[str] = None,
+    token: Optional[str] = None,
+) -> dict:
+    """Open a pull request using GitHub's REST API."""
+    repo = repository or os.getenv("GITHUB_REPOSITORY")
+    if not repo:
+        raise ValueError("GITHUB_REPOSITORY not configured")
+    api_url = f"https://api.github.com/repos/{repo}/pulls"
+    payload = {"title": title, "body": body, "head": head, "base": base}
+    headers = {"Accept": "application/vnd.github+json"}
+    token = token or os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=30)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Failed to create PR: {resp.status_code} {resp.text}")
+    return resp.json()
+
+
+def format_issues_for_prompt(issues: Iterable[Mapping[str, object]]) -> str:
+    """Render Sonar issues in a human prompt friendly format."""
+    lines: list[str] = []
+    for issue in issues:
+        severity = issue.get("severity") or "UNKNOWN"
+        rule = issue.get("rule") or ""
+        component = issue.get("component") or ""
+        message = issue.get("message") or ""
+        line = issue.get("line")
+        location = f"{component}:{line}" if line else str(component)
+        lines.append(f"[{severity}] {rule} @ {location}\n{message}")
+    return "\n\n".join(lines)

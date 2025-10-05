@@ -1,41 +1,35 @@
+"""Common data structures for A2A agent communication."""
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, Any, Optional
+from typing import Literal, Optional, TypedDict
+
 
 @dataclass
-class A2AMessage:
-    type: str
-    content: Dict[str, Any]
-    metadata: Optional[Dict[str, Any]] = None
+class Issue:
+    key: str
+    rule: str
+    severity: str
+    component: str
+    message: str
+    line: Optional[int]
 
-def create_fix_request(issue_key: str, rule: str, severity: str, 
-                      file_path: str, source_code: str, 
-                      line_number: Optional[int] = None,
-                      message: Optional[str] = None) -> A2AMessage:
-    return A2AMessage(
-        type="fix_request",
-        content={
-            "issue_key": issue_key,
-            "rule": rule,
-            "severity": severity,
-            "file_path": file_path,
-            "source_code": source_code,
-            "line_number": line_number,
-            "message": message or ""
-        }
-    )
 
-def create_fix_response(patch: str, explanation: str = "") -> A2AMessage:
-    return A2AMessage(
-        type="fix_response",
-        content={
-            "patch": patch,
-            "explanation": explanation
-        }
-    )
+class State(TypedDict, total=False):
+    issue: Issue
+    context: str
+    patch: str
+    attempt: int
+    fixer_summary: str
+    tester_summary: str
+    test_logs: str
+    test_passed: bool
+    sonar_summary: str
+    sonar_passed: bool
+    pr_url: str
+    branch: str
+    feedback_log: str
+    fix_failed: bool
 
-def create_test_response(test_result: dict) -> A2AMessage:
-    return A2AMessage(
-        type="test_response",
-        content=test_result,
-        metadata={"timestamp": "2024-01-01T00:00:00Z"}
-    )
+
+Role = Literal["requester", "fixer", "tester", "sonar", "open_pr"]

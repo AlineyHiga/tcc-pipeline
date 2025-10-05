@@ -1,190 +1,187 @@
-from flask import Flask, request, jsonify
-from .protocol import A2AMessage, create_fix_response
-import requests
-import json
-import re
+"""Fixer agent: generates and applies patches based on Requester context."""
+from __future__ import annotations
+
+import difflib
+import logging
+import os
+from pathlib import Path
+from typing import Optional, Union
+
+from app.a2a.protocol import State
+from app.llm_client import LLMClient
+
+LOGGER = logging.getLogger(__name__)
+
+SYSTEM_PROMPT = """
+Você é o Fixer Agent. Receba o contexto preparado pelo Requester e gere o código Python corrigido.
+Instruções:
+- Analise o problema reportado pelo SonarQube
+- Corrija APENAS o problema específico mencionado
+- Mantenha toda a estrutura e funcionalidade existente
+- Retorne APENAS o código Python corrigido, sem explicações
+- Não adicione comentários extras
+- Preserve a indentação original
+"""
+
 
 class FixerAgent:
-    def __init__(self, llm_endpoint="http://localhost:11435/api/generate"):
-        self.app = Flask(__name__)
-        self.llm_endpoint = llm_endpoint
-        self.setup_routes()
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        repo_root: Optional[Union[Path, str]] = None,
+    ) -> None:
+        self.llm = LLMClient(role="fixer", temperature=temperature)
+        env_root = os.getenv("A2A_REPO_ROOT")
+        if repo_root:
+            base = Path(repo_root)
+        elif env_root:
+            base = Path(env_root)
+        else:
+            base = Path.cwd()
+        self.repo_root = base.resolve()
+        LOGGER.debug("Fixer repo root set to %s", self.repo_root)
 
-    def setup_routes(self):
-        @self.app.route('/fix', methods=['POST'])
-        def handle_fix_request():
-            data = request.json
-            message = A2AMessage(
-                type=data['type'],
-                content=data['content'],
-                metadata=data.get('metadata')
+    def invoke(self, state: State) -> State:
+        context = state.get("context", "")
+        issue = state.get("issue")
+
+        LOGGER.debug("Fixer received context with %d chars", len(context))
+        if context:
+            LOGGER.debug("Fixer context preview: %s", context[:500].replace("\n", "\\n"))
+        if issue is not None:
+            LOGGER.debug(
+                "Fixer issue: message=%s rule=%s", getattr(issue, "message", ""), getattr(issue, "rule", "")
             )
-            
-            patch = self.generate_patch(message)
-            response = create_fix_response(patch, "Auto-generated fix")
-            
-            return jsonify({
-                "type": response.type,
-                "content": response.content,
-                "metadata": response.metadata
+
+        file_hint = self._extract_file_path(context)
+        LOGGER.debug("Fixer target file path hint: %s", file_hint)
+        resolved_path = self._resolve_file_path(file_hint)
+        if not resolved_path:
+            LOGGER.error("Fixer could not resolve target file: %s", file_hint)
+            state.update({
+                "fixer_summary": "Arquivo não encontrado",
+                "fix_failed": True,
+            })
+            return state
+
+        diff_path = self._format_diff_path(resolved_path, file_hint)
+        LOGGER.debug("Fixer resolved target file to %s (diff path %s)", resolved_path, diff_path)
+        original_content = resolved_path.read_text()
+        LOGGER.debug("Original file size: %d chars", len(original_content))
+
+        prompt = (
+            f"{SYSTEM_PROMPT}\n\nProblema: {getattr(issue, 'message', '')}\nRegra: {getattr(issue, 'rule', '')}"
+            f"\n\nCódigo original:\n{original_content}"
+        )
+        LOGGER.debug("Prompt size sent to LLM: %d chars", len(prompt))
+        raw_response = self.llm.invoke(prompt, context)
+        LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
+        fixed_content = raw_response.strip()
+        LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
+
+        fixed_content = self._clean_code_response(fixed_content)
+        LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
+
+        patch = self._generate_patch(original_content, fixed_content, diff_path)
+        LOGGER.info("Generated patch (first 1k chars): %s", patch[:1000])
+        LOGGER.debug("Generated patch size: %d chars", len(patch))
+        state["patch"] = patch
+
+        if not patch or "@@" not in patch:
+            LOGGER.error("Fixer produced invalid patch for %s", diff_path)
+            state.update({
+                "fixer_summary": "Falha ao gerar patch válido",
+                "fix_failed": True,
+            })
+        else:
+            state.update({
+                "fixer_summary": "Patch gerado com sucesso",
+                "fix_failed": False,
             })
 
-    def generate_patch(self, message: A2AMessage) -> str:
-        content = message.content
-        return self._generate_llm_patch(content)
-    
-    def _generate_llm_patch(self, content: dict) -> str:
-        prompt = self._build_prompt(content)
-        file_path = content.get('file_path', 'file.py')
-        result = self._call_llm(prompt)
-        patch = self._extract_patch(result, file_path)
-        if patch:
-            return patch
+        return state
 
-        retry_prompt = (
-            prompt
-            + "\n\nYou must output only the unified diff patch now. Repeat the diff format exactly as shown."
-        )
-        retry_result = self._call_llm(retry_prompt)
-        patch = self._extract_patch(retry_result, file_path)
-        if patch:
-            return patch
-
-        print("[yellow]Using fallback - no valid patch in LLM response after retry")
-        return self._fallback_fix(content)
-
-    def _build_prompt(self, content: dict) -> str:
-        return f"""Fix this SonarQube issue: {content.get('message', '')}
-
-File: {content.get('file_path', 'file.py')}
-Code:
-{content.get('source_code', '')}
-
-Output ONLY the unified diff patch. No explanations.
-
---- a/{content.get('file_path', 'file.py')}
-+++ b/{content.get('file_path', 'file.py')}
-@@ -line,count +line,count @@
--old line
-+new line
-"""
-    
-    def _call_llm(self, prompt: str) -> str:
-        try:
-            print(f"[cyan]Calling LLM at {self.llm_endpoint}...")
-            print("[magenta]Prompt sent to LLM:\n" + prompt)
-            response = requests.post(
-                self.llm_endpoint,
-                json={
-                    "model": "llama",
-                    "prompt": prompt,
-                    "max_tokens": 300,
-                    "temperature": 0.0,
-                    "stream": False,
-                },
-                timeout=120,
-            )
-            print(f"[yellow]LLM response status: {response.status_code}")
-            if response.status_code == 200:
-                result = response.json().get("response", "")
-                print(f"[green]LLM generated response (first 100 chars): {result[:100]}...")
-                print("[magenta]Full LLM response:\n" + result)
-                return result
-        except Exception as e:
-            print(f"[red]LLM error: {e}")
+    def _extract_file_path(self, context: str) -> str:
+        """Extract file path from context."""
+        lines = context.split('\n')
+        for line in lines:
+            if 'Arquivo alvo:' in line:
+                return line.split(':', 1)[1].strip()
         return ""
 
-    def _extract_patch(self, result: str, file_path: str) -> str:
-        if not result:
-            return ""
+    def _resolve_file_path(self, reference: str) -> Optional[Path]:
+        """Resolve file references relative to the configured repo root."""
+        if not reference:
+            return None
+        candidate_paths = []
+        raw = Path(reference)
+        if raw.is_absolute():
+            candidate_paths.append(raw)
+        candidate_paths.append(self.repo_root / raw)
+        candidate_paths.append(Path.cwd() / raw)
 
-        if '---' not in result or '+++' not in result:
-            return ""
-
-        cleaned_lines = []
-        for raw_line in result.split('\n'):
-            stripped = raw_line.strip()
-            if stripped.startswith('```'):
+        seen = set()
+        for candidate in candidate_paths:
+            try:
+                resolved = candidate.resolve()
+            except FileNotFoundError:
                 continue
-            normalized = re.sub(r'^\s*\d+[\.)]\s*', '', raw_line.rstrip('\n'))
-            cleaned_lines.append(normalized)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if resolved.exists():
+                return resolved
+        return None
 
-        patch_lines = []
-        in_patch = False
-        allowed_prefixes = ('---', '+++', '@@', '-', '+', ' ')
-        for raw_line in cleaned_lines:
-            detection_line = raw_line.lstrip()
-            if detection_line.startswith('---'):
-                in_patch = True
-            if in_patch:
-                if detection_line and not detection_line.startswith(allowed_prefixes):
+    def _format_diff_path(self, absolute: Path, hint: str) -> str:
+        """Return a path string appropriate for unified diff headers."""
+        try:
+            return absolute.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            if hint:
+                return Path(hint).as_posix()
+            return absolute.as_posix()
+
+    def _clean_code_response(self, response: str) -> str:
+        """Remove code fences and extra text from LLM response."""
+        cleaned = response.strip()
+        if '```' in response:
+            parts = response.split('```')
+            for part in parts:
+                trimmed = part.strip()
+                if not trimmed:
+                    continue
+                if 'import' in trimmed or 'def ' in trimmed or 'class ' in trimmed:
+                    cleaned = trimmed
                     break
-                if detection_line.startswith(allowed_prefixes):
-                    candidate = detection_line
-                else:
-                    candidate = ' ' + detection_line
-                patch_lines.append(candidate)
+        if cleaned.lower().startswith('python'):
+            lines = cleaned.splitlines()
+            if lines and lines[0].strip().lower() == 'python':
+                cleaned = '
+'.join(lines[1:])
+        return cleaned.strip()
 
-        patch = '\n'.join(patch_lines).strip()
-        if not (patch.startswith('---') and '+++' in patch and '@@' in patch):
-            return ""
-
-        normalized = patch.split('\n')
-        expected_old = f"--- a/{file_path}"
-        expected_new = f"+++ b/{file_path}"
-        if normalized:
-            normalized[0] = expected_old
-        if len(normalized) > 1:
-            normalized[1] = expected_new
-
-        sanitized_lines = []
-        for line in normalized:
-            # Reject patches with explanations or commentary
-            if any(word in line.lower() for word in ['sure', 'here', 'patch', 'fixes', 'note', 'however', 'explanation']):
-                return ""
-            if line.startswith(('-', '+')):
-                # reject lines with obvious narrative artifacts
-                if '//' in line or 'http' in line or 'Added missing' in line or 'Removed' in line:
-                    return ""
-            sanitized_lines.append(line)
-
-        return '\n'.join(sanitized_lines)
-
-    def _fallback_fix(self, content: dict) -> str:
-        print("[yellow]Using fallback fix (not LLM)")
-        source_code = content.get('source_code', '')
-        file_path = content.get('file_path', '')
-        
-        # Simple fallback: add docstring to functions
-        lines = source_code.split('\n')
-        fixed_lines = []
-        
-        for line in lines:
-            fixed_lines.append(line)
-            if line.strip().startswith('def ') and ':' in line:
-                indent = len(line) - len(line.lstrip())
-                docstring = ' ' * (indent + 4) + '"""Function docstring."""'
-                fixed_lines.append(docstring)
-        
-        fixed_code = '\n'.join(fixed_lines)
-        return self._create_unified_diff(source_code, fixed_code, file_path)
-
-    def _create_unified_diff(self, original: str, fixed: str, file_path: str) -> str:
+    def _generate_patch(self, original: str, fixed: str, file_path: str) -> str:
+        """Generate unified diff patch."""
         if original == fixed:
             return ""
-        
-        original_lines = original.split('\n')
-        fixed_lines = fixed.split('\n')
-        
-        diff = f"--- a/{file_path}\n+++ b/{file_path}\n"
-        diff += f"@@ -1,{len(original_lines)} +1,{len(fixed_lines)} @@\n"
-        
-        for line in original_lines:
-            diff += f"-{line}\n"
-        for line in fixed_lines:
-            diff += f"+{line}\n"
-        
-        return diff
 
-    def run(self, host='localhost', port=9090):
-        self.app.run(host=host, port=port, debug=True)
+        original_lines = original.splitlines(keepends=True)
+        fixed_lines = fixed.splitlines(keepends=True)
+
+        diff_lines = list(
+            difflib.unified_diff(
+                original_lines,
+                fixed_lines,
+                fromfile=f"a/{file_path}",
+                tofile=f"b/{file_path}",
+                lineterm='\n',
+            )
+        )
+        if not diff_lines:
+            return ""
+        diff_text = ''.join(diff_lines)
+        header = f"diff --git a/{file_path} b/{file_path}\n"
+        if not diff_text.endswith('\n'):
+            diff_text += '\n'
+        return header + diff_text
