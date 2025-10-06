@@ -174,6 +174,8 @@ class DeploymentAgent:
         else:
             summary = summary or "Falha ao criar PR"
 
+        LOGGER.info("LLM deployment response: %s", summary)
+
         state.update(
             {
                 "branch": branch,
