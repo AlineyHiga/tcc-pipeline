@@ -191,6 +191,14 @@ class DeploymentAgent:
 
     # Helpers ----------------------------------------------------------------
     def _setup_pull_request_tool(self):
+        app_id = os.getenv("GITHUB_APP_ID")
+        app_key = os.getenv("GITHUB_APP_PRIVATE_KEY")
+        if not app_id or not app_key:
+            LOGGER.info(
+                "Credenciais de GitHub App não definidas; usando fallback baseado em token pessoal."
+            )
+            return self._build_pat_pull_request_tool()
+
         try:
             wrapper = GitHubAPIWrapper(github_repo=self.repo)
             toolkit = GitHubToolkit.from_github_api_wrapper(wrapper)
