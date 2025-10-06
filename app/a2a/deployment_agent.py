@@ -201,7 +201,7 @@ class DeploymentAgent:
             return self._build_pat_pull_request_tool()
 
         try:
-            wrapper = GitHubAPIWrapper(github_repo=self.repo)
+            wrapper = GitHubAPIWrapper(github_repository=self.repo)
             toolkit = GitHubToolkit.from_github_api_wrapper(wrapper)
             tool = self._resolve_pull_request_tool(toolkit)
             LOGGER.info("GitHubToolkit inicializado com credenciais de GitHub App")
