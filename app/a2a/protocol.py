@@ -21,6 +21,7 @@ class State(TypedDict, total=False):
     patch: str
     attempt: int
     fixer_summary: str
+    deployment_summary: str
     tester_summary: str
     test_logs: str
     test_passed: bool
@@ -30,6 +31,7 @@ class State(TypedDict, total=False):
     branch: str
     feedback_log: str
     fix_failed: bool
+    deployment_failed: bool
 
 
-Role = Literal["requester", "fixer", "tester", "sonar", "open_pr"]
+Role = Literal["requester", "fixer", "tester", "sonar", "deployment"]

@@ -11,9 +11,10 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.a2a import FixerAgent, Issue, RequesterAgent, State, TesterAgent
+from app.a2a.deployment_agent import deployment_node
 from app.a2a.patcher_tool import apply_patch_node
 from app.sonarqube_client import SonarIssue, SonarQubeClient, format_issue
-from app.utils import create_pull_request, ensure_git_branch, format_issues_for_prompt, git_commit_all, run_sonar_scanner
+from app.utils import format_issues_for_prompt, run_sonar_scanner
 
 load_dotenv()
 
@@ -22,8 +23,6 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "3"))
 ISSUE_SEVERITIES = [s.strip() for s in os.getenv("ISSUE_SEVERITIES", "MAJOR,CRITICAL").split(",") if s.strip()]
-BASE_BRANCH = os.getenv("BASE_BRANCH", "main")
-AUTO_BRANCH_PREFIX = os.getenv("AUTO_BRANCH_PREFIX", "autofix")
 
 
 def sonar_issue_to_issue(issue: SonarIssue) -> Issue:
@@ -100,38 +99,6 @@ def sonar_node(state: State) -> State:
     return state
 
 
-def maybe_open_pr_node(state: State) -> State:
-    issue = state["issue"]
-    branch_name = state.get("branch") or f"{AUTO_BRANCH_PREFIX}/{issue.key}"
-    ensure_git_branch(branch_name)
-    git_commit_all(f"fix: auto remediation for {issue.key}")
-    state["branch"] = branch_name
-    try:
-        body_lines = [
-            "Correção automática via pipeline AutoFix.",
-            "",
-            f"Issue Sonar: `{issue.key}`",
-            "",
-            "Feedback acumulado:",
-            state.get("feedback_log", "-"),
-            "",
-            "Logs do Tester:",
-            "```",
-            state.get("test_logs", ""),
-            "```",
-        ]
-        pr = create_pull_request(
-            title=f"fix: AutoFix for {issue.key}",
-            body="\n".join(body_lines),
-            head=branch_name,
-            base=BASE_BRANCH,
-        )
-        state["pr_url"] = pr.get("html_url", "")
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.error("Falha ao criar PR: %s", exc)
-    return state
-
-
 def after_patch_router(state: State) -> str:
     if state.get("fix_failed"):
         append_feedback(state, "Falha do Fixer", state.get("fixer_summary", ""))
@@ -157,7 +124,7 @@ def after_tester_router(state: State) -> str:
 
 def after_sonar_router(state: State) -> str:
     if state.get("sonar_passed"):
-        return "open_pr"
+        return "deployment"
     append_feedback(state, "Feedback Sonar", state.get("sonar_summary", ""))
     attempt = int(state.get("attempt", 1))
     if attempt >= MAX_ROUNDS:
@@ -173,7 +140,7 @@ def run_graph_for_issue(issue: Issue) -> State:
     builder.add_node("patcher", apply_patch_node)
     builder.add_node("tester", tester_node)
     builder.add_node("sonar", sonar_node)
-    builder.add_node("open_pr", maybe_open_pr_node)
+    builder.add_node("deployment", deployment_node)
 
     builder.add_edge(START, "requester")
     builder.add_edge("requester", "fixer")
@@ -189,11 +156,11 @@ def run_graph_for_issue(issue: Issue) -> State:
         "end": END,
     })
     builder.add_conditional_edges("sonar", after_sonar_router, {
-        "open_pr": "open_pr",
+        "deployment": "deployment",
         "fixer": "fixer",
         "end": END,
     })
-    builder.add_edge("open_pr", END)
+    builder.add_edge("deployment", END)
 
     graph = builder.compile(checkpointer=MemorySaver())
     initial_state: State = {"issue": issue, "attempt": 1, "feedback_log": ""}

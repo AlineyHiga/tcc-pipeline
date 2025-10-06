@@ -4,8 +4,11 @@ from __future__ import annotations
 import difflib
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Optional, Union
+
+from langchain_core.prompts import ChatPromptTemplate
 
 from app.a2a.protocol import State
 from app.llm_client import LLMClient
@@ -40,6 +43,19 @@ class FixerAgent:
             base = Path.cwd()
         self.repo_root = base.resolve()
         LOGGER.debug("Fixer repo root set to %s", self.repo_root)
+        self.prompt = ChatPromptTemplate.from_messages(
+            [
+                (
+                    "human",
+                    "Você receberá um issue do SonarQube e deve responder com o arquivo Python completo corrigido.\n"
+                    "Regra: {issue_rule}\n"
+                    "Mensagem: {issue_message}\n"
+                    "Arquivo: {target_path}\n"
+                    "Contexto adicional:\n{requester_context}\n\n"
+                    "Código original:\n{original_code}",
+                )
+            ]
+        )
 
     def invoke(self, state: State) -> State:
         context = state.get("context", "")
@@ -69,19 +85,33 @@ class FixerAgent:
         original_content = resolved_path.read_text()
         LOGGER.debug("Original file size: %d chars", len(original_content))
 
-        prompt = (
-            f"{SYSTEM_PROMPT}\n\nProblema: {getattr(issue, 'message', '')}\nRegra: {getattr(issue, 'rule', '')}"
-            f"\n\nCódigo original:\n{original_content}"
-        )
-        LOGGER.debug("Prompt size sent to LLM: %d chars", len(prompt))
-        raw_response = self.llm.invoke(prompt, context)
+        prompt_input = {
+            "issue_rule": getattr(issue, "rule", ""),
+            "issue_message": getattr(issue, "message", ""),
+            "target_path": diff_path,
+            "requester_context": context or "(Contexto indisponível)",
+            "original_code": original_content,
+        }
+        prompt_value = self.prompt.format_prompt(**prompt_input)
+        user_prompt = prompt_value.to_messages()[0].content
+        LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
+        raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
         LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
         fixed_content = raw_response.strip()
         LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
 
+        # Limpa resposta de cercas de código ou prefixos
         fixed_content = self._clean_code_response(fixed_content)
         LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
 
+        # Se o LLM retornou um diff parcial (sem header git), sanitiza antes
+        if self._looks_like_diff_response(fixed_content):
+            LOGGER.warning("Fixer detected diff-like output, sanitizing.")
+            fixed_content = self._sanitize_diff_like_response(
+                fixed_content, diff_path, original_content
+            )
+
+        # Gera diff unificado completo
         patch = self._generate_patch(original_content, fixed_content, diff_path)
         LOGGER.info("Generated patch (first 1k chars): %s", patch[:1000])
         LOGGER.debug("Generated patch size: %d chars", len(patch))
@@ -100,6 +130,8 @@ class FixerAgent:
             })
 
         return state
+
+    # ---------------------------------------------------------------------
 
     def _extract_file_path(self, context: str) -> str:
         """Extract file path from context."""
@@ -157,13 +189,70 @@ class FixerAgent:
         if cleaned.lower().startswith('python'):
             lines = cleaned.splitlines()
             if lines and lines[0].strip().lower() == 'python':
-                cleaned = '
-'.join(lines[1:])
+                cleaned = ''.join(lines[1:])
         return cleaned.strip()
 
+    def _looks_like_diff_response(self, response: str) -> bool:
+        """Heuristic to detect diff snippets in the LLM output."""
+        if not response:
+            return False
+        diff_pattern = re.compile(r"^(diff --git|--- |\+\+\+ |@@)", re.MULTILINE)
+        match = bool(diff_pattern.search(response))
+        LOGGER.debug("Diff-like response detected=%s", match)
+        return match
+
+    def _sanitize_diff_like_response(self, response: str, file_path: str, original: str) -> str:
+        """
+        Corrige respostas onde o LLM retornou um pseudo-diff em vez de código puro.
+        Retorna código Python 'limpo' que pode ser usado para gerar um diff válido.
+        """
+        lines = response.splitlines()
+        LOGGER.debug(
+            "Sanitizing diff-like response for %s: %d raw lines",
+            file_path,
+            len(lines),
+        )
+        clean_lines = []
+        skipped_headers = skipped_code_prefix = skipped_fences = 0
+        for line in lines:
+            # remove headers típicos de diff
+            stripped = line.strip()
+            if re.match(r"^(diff|---|\+\+\+|@@)", stripped):
+                skipped_headers += 1
+                continue
+            # remove prefixos incorretos como '+python'
+            if stripped.startswith("+python"):
+                skipped_code_prefix += 1
+                continue
+            # remove cercas de código
+            if stripped.startswith("```"):
+                skipped_fences += 1
+                continue
+            clean_lines.append(line + "\n")
+
+        cleaned = "".join(clean_lines).strip()
+        LOGGER.debug(
+            "Sanitize diff-like response kept %d lines (headers=%d, +python=%d, fences=%d)",
+            len(clean_lines),
+            skipped_headers,
+            skipped_code_prefix,
+            skipped_fences,
+        )
+        if not cleaned or cleaned == original.strip():
+            LOGGER.warning("Sanitize produced no new code; fallback to original content.")
+            return original
+        return cleaned
+
     def _generate_patch(self, original: str, fixed: str, file_path: str) -> str:
-        """Generate unified diff patch."""
-        if original == fixed:
+        """Generate unified diff patch with guaranteed valid header."""
+        LOGGER.debug(
+            "Generating patch for %s: original=%d chars fixed=%d chars",
+            file_path,
+            len(original),
+            len(fixed),
+        )
+        if not fixed.strip() or fixed.strip() == original.strip():
+            LOGGER.warning("Fixer produced identical content or empty fix.")
             return ""
 
         original_lines = original.splitlines(keepends=True)
@@ -175,13 +264,27 @@ class FixerAgent:
                 fixed_lines,
                 fromfile=f"a/{file_path}",
                 tofile=f"b/{file_path}",
-                lineterm='\n',
+                lineterm="\n",
             )
         )
+
         if not diff_lines:
+            LOGGER.error("Unified diff generation returned empty output.")
             return ""
-        diff_text = ''.join(diff_lines)
+
         header = f"diff --git a/{file_path} b/{file_path}\n"
-        if not diff_text.endswith('\n'):
-            diff_text += '\n'
-        return header + diff_text
+        diff_text = "".join(diff_lines)
+        LOGGER.debug(
+            "Unified diff for %s has %d lines before header",
+            file_path,
+            len(diff_lines),
+        )
+        if not diff_text.endswith("\n"):
+            diff_text += "\n"
+        full_diff = header + diff_text
+        LOGGER.debug(
+            "Generated patch for %s totals %d chars",
+            file_path,
+            len(full_diff),
+        )
+        return full_diff
