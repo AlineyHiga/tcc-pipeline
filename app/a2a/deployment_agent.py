@@ -130,6 +130,12 @@ class DeploymentAgent:
 
         for iteration in range(4):
             response = self.llm_with_tools.invoke(messages)
+            LOGGER.debug(
+                "LLM tool-call iteration %d response content=%s tool_calls=%s",
+                iteration + 1,
+                self._coerce_content_to_text(response.content),
+                getattr(response, "tool_calls", []),
+            )
             messages.append(response)
             tool_calls = getattr(response, "tool_calls", [])
             if not tool_calls:
@@ -149,6 +155,11 @@ class DeploymentAgent:
                     args.setdefault("base", self.base_branch)
                     tool_result = self.pull_request_tool.invoke(args)
                     pr_response = tool_result
+                LOGGER.debug(
+                    "Tool %s responded with %s",
+                    name,
+                    tool_result,
+                )
                 tool_message = ToolMessage(
                     content=json.dumps(tool_result, ensure_ascii=False, default=str),
                     tool_call_id=call.get("id"),

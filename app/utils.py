@@ -92,7 +92,13 @@ def create_pull_request(
     token = token or os.getenv("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    LOGGER.debug(
+        "Creating pull request payload=%s headers=%s",
+        payload,
+        {k: ('***' if k.lower() == 'authorization' else v) for k, v in headers.items()},
+    )
     resp = requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=30)
+    LOGGER.debug("GitHub create PR response status=%s body=%s", resp.status_code, resp.text)
     if resp.status_code >= 400:
         raise RuntimeError(f"Failed to create PR: {resp.status_code} {resp.text}")
     return resp.json()
