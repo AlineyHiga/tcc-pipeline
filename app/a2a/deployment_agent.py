@@ -169,6 +169,7 @@ class DeploymentAgent:
             summary = "O modelo não retornou resposta final após usar a ferramenta."
 
         pr_url = self._extract_pr_url(pr_response)
+        LOGGER.debug("Final tool response payload: %s", pr_response)
         if pr_url:
             summary = summary or "PR criado com sucesso"
         else:
