@@ -209,7 +209,7 @@ class FixerAgent:
         if cleaned.lower().startswith('python'):
             lines = cleaned.splitlines()
             if lines and lines[0].strip().lower() == 'python':
-                cleaned = ''.join(lines[1:])
+                cleaned = '\n'.join(lines[1:])
         return cleaned.strip()
 
     def _looks_like_diff_response(self, response: str) -> bool:
