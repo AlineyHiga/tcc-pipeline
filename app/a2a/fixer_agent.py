@@ -20,9 +20,8 @@ Você é o Fixer Agent. Receba o contexto preparado pelo Requester e devolva o a
 Instruções:
 - Analise o problema reportado pelo SonarQube
 - Corrija APENAS o problema específico mencionado
-- Mantenha toda a estrutura e funcionalidade existente
-- Retorne SOMENTE o código Python final, pronto para uso, sem explicações ou diff
-- Não adicione comentários extras
+- Reflita as correções em TODO o arquivo, mantendo a estrutura e funcionalidades existentes
+- Retorne SOMENTE o código Python final dentro de um bloco ```python``` (sem explicações, diffs ou comentários extras)
 - Preserve a indentação e o formato do arquivo
 """
 
@@ -52,7 +51,8 @@ class FixerAgent:
                     "Mensagem: {issue_message}\n"
                     "Arquivo: {target_path}\n"
                     "Contexto adicional:\n{requester_context}\n\n"
-                    "Código original:\n{original_code}",
+                    "Código original:\n{original_code}\n\n"
+                    "Retorne apenas um bloco ```python``` contendo o arquivo completo com as correções aplicadas.",
                 )
             ]
         )
@@ -197,20 +197,38 @@ class FixerAgent:
     def _clean_code_response(self, response: str) -> str:
         """Remove code fences and extra text from LLM response."""
         cleaned = response.strip()
-        if '```' in response:
-            parts = response.split('```')
-            for part in parts:
-                trimmed = part.strip()
-                if not trimmed:
-                    continue
-                if 'import' in trimmed or 'def ' in trimmed or 'class ' in trimmed:
-                    cleaned = trimmed
-                    break
-        if cleaned.lower().startswith('python'):
-            lines = cleaned.splitlines()
+        if not cleaned:
+            return ""
+
+        # Remove possíveis tokens sentinela devolvidos pelo modelo (ex: <|im_end|]>).
+        cleaned = cleaned.replace("<|im_end|]>", "").strip()
+
+        fence_pattern = re.compile(r"```(?:python|py)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
+        match = fence_pattern.search(cleaned)
+        code_block = ""
+        if match:
+            code_block = match.group(1).strip()
+            LOGGER.debug("Código extraído de bloco markdown ```python``` com %d chars", len(code_block))
+        else:
+            LOGGER.warning("Nenhum bloco ```python``` encontrado; aplicando heurística de fallback.")
+            if '```' in cleaned:
+                parts = cleaned.split('```')
+                for part in parts:
+                    trimmed = part.strip()
+                    if not trimmed:
+                        continue
+                    if 'import ' in trimmed or 'def ' in trimmed or 'class ' in trimmed:
+                        code_block = trimmed
+                        break
+            if not code_block:
+                code_block = cleaned
+
+        if code_block.lower().startswith("python"):
+            lines = code_block.splitlines()
             if lines and lines[0].strip().lower() == 'python':
-                cleaned = '\n'.join(lines[1:])
-        return cleaned.strip()
+                code_block = '\n'.join(lines[1:]).strip()
+
+        return code_block.strip()
 
     def _looks_like_diff_response(self, response: str) -> bool:
         """Heuristic to detect diff snippets in the LLM output."""
