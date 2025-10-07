@@ -1,9 +1,7 @@
-name: AutoFix SonarQube A2A (PGS)
+name: AutoFix Pipeline
 
 on:
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
@@ -12,43 +10,25 @@ permissions:
 jobs:
   autofix:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: SonarQube Scan (pre)
+      - name: Build sandbox image
+        run: docker build -f tcc-pipeline/Dockerfile.autofix -t autofix:latest .
+      - name: Run AutoFix Pipeline
         env:
-          SONAR_HOST_URL: ${{ secrets.SONARQUBE_URL }}
-          SONAR_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
-        run: |
-          if command -v sonar-scanner >/dev/null 2>&1; then
-            sonar-scanner
-          else
-            docker run --rm               -e SONAR_HOST_URL="$SONAR_HOST_URL"               -e SONAR_TOKEN="$SONAR_TOKEN"               -v "$PWD:/usr/src" sonarsource/sonar-scanner-cli
-          fi
-
-      - name: Run AutoFix Flow (PGS loop)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          AUTOFIX_DOCKER_IMAGE: autofix:latest
           SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
           SONARQUBE_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
           SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
-          GITHUB_TOKEN: ${{ github.token }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          MAX_ROUNDS: 3
-          ISSUE_SEVERITIES: MAJOR,CRITICAL
-          LANGUAGE: py
-        run: python -m app.main
+          A2A_REPO_ROOT: ${{ github.workspace }}/tcc-pipeline
+        run: |
+          cd tcc-pipeline
+          python -m app.main

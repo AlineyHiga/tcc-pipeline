@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+from typing import List, Tuple
 
 from app.a2a.protocol import State
 from app.llm_client import LLMClient
@@ -22,23 +23,41 @@ class TesterAgent:
     def __init__(self, temperature: float = 0.0) -> None:
         self.llm = LLMClient(role="tester", temperature=temperature)
 
-    def run_tests(self) -> tuple[bool, str]:
+    def _run_command(self, command: List[str]) -> Tuple[bool, str]:
+        LOGGER.debug("Tester executando comando: %s", command)
         proc = subprocess.run(
-            ["pytest", "-q", "--disable-warnings"],
+            command,
             capture_output=True,
             text=True,
             check=False,
         )
-        logs = (proc.stdout or "") + (proc.stderr or "")
-        LOGGER.debug("pytest logs: %s", logs)
-        return proc.returncode == 0, logs
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode == 0, output
+
+    def run_suite(self) -> Tuple[bool, bool, str]:
+        pytest_ok, pytest_logs = self._run_command(["pytest", "-q", "--disable-warnings"])
+        ruff_ok, ruff_logs = self._run_command(["ruff", "check", "."])
+        black_ok, black_logs = self._run_command(["black", "--check", "."])
+
+        aggregate_logs = "\n\n".join(
+            [
+                "pytest -q:\n" + pytest_logs.strip(),
+                "ruff check .:\n" + ruff_logs.strip(),
+                "black --check .:\n" + black_logs.strip(),
+            ]
+        ).strip()
+
+        lint_passed = ruff_ok and black_ok
+        return pytest_ok, lint_passed, aggregate_logs
 
     def invoke(self, state: State) -> State:
-        passed, logs = self.run_tests()
-        prompt = "Logs de teste (pytest/Hypothesis):\n" + logs
+        tests_ok, lint_ok, logs = self.run_suite()
+        prompt = "Logs de teste e lint:\n" + logs
         summary = self.llm.invoke(SYSTEM_TESTER, prompt)
         state.update({
-            "test_passed": passed,
+            "test_passed": tests_ok,
+            "lint_passed": lint_ok,
+            "test_output": logs,
             "test_logs": logs,
             "tester_summary": summary,
         })

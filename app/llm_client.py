@@ -48,8 +48,25 @@ class LLMClient:
                 "langchain-openai não está instalado. Instale as dependências via "
                 "`pip install -r requirements.txt` ou configure LLM_PROVIDER=local"
             ) from exc
+
         model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-        return ChatOpenAI(model=model, temperature=self.temperature)
+        base_url = os.getenv("OPENAI_BASE_URL")
+        api_key = os.getenv("OPENAI_API_KEY") or ("ollama" if base_url else None)
+
+        if not api_key:
+            raise RuntimeError(
+                "OPENAI_API_KEY não definido. Configure uma chave real ou, para Ollama/local, "
+                "defina OPENAI_API_KEY=ollama e OPENAI_BASE_URL apontando para o endpoint compatível"
+            )
+
+        kwargs: Dict[str, Any] = {
+            "model": model,
+            "temperature": self.temperature,
+            "api_key": api_key,
+        }
+        if base_url:
+            kwargs["base_url"] = base_url
+        return ChatOpenAI(**kwargs)
 
     def _invoke_openai(self, system_prompt: str, user_prompt: str) -> str:
         from langchain.schema import HumanMessage, SystemMessage

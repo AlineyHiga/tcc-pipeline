@@ -17,17 +17,23 @@ class Issue:
 
 class State(TypedDict, total=False):
     issue: Issue
+    issues: List[Issue]
+    issues_for_file: List[Issue]
+    plan_summary: str
+    multi_issue_summary: str
     context: str
     patch: str
-    attempt: int
-    module_issues: List[Issue]
     fixer_summary: str
-    deployment_summary: str
+    executor_summary: str
+    execution_failed: bool
+    test_output: str
     tester_summary: str
-    test_logs: str
     test_passed: bool
+    lint_passed: bool
     sonar_summary: str
     sonar_passed: bool
+    deployment_summary: str
+    file_path: str
     pr_url: str
     branch: str
     feedback_log: str

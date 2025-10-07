@@ -6,7 +6,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -59,17 +59,16 @@ class FixerAgent:
 
     def invoke(self, state: State) -> State:
         context = state.get("context", "")
+        issues_for_file: List = list(state.get("issues_for_file") or [])
         issue = state.get("issue")
 
         LOGGER.debug("Fixer received context with %d chars", len(context))
         if context:
             LOGGER.debug("Fixer context preview: %s", context[:500].replace("\n", "\\n"))
-        if issue is not None:
-            LOGGER.debug(
-                "Fixer issue: message=%s rule=%s", getattr(issue, "message", ""), getattr(issue, "rule", "")
-            )
+        if issues_for_file:
+            LOGGER.debug("Fixer issues for file: %s", [item.key for item in issues_for_file])
 
-        file_hint = self._extract_file_path(context)
+        file_hint = state.get("file_path") or self._extract_file_path(context)
         LOGGER.debug("Fixer target file path hint: %s", file_hint)
         resolved_path = self._resolve_file_path(file_hint)
         if not resolved_path:
@@ -85,9 +84,16 @@ class FixerAgent:
         original_content = resolved_path.read_text()
         LOGGER.debug("Original file size: %d chars", len(original_content))
 
+        issues_block = self._render_issue_list(issues_for_file or ([issue] if issue else []))
+        issue_rules = [
+            getattr(item, "rule", "")
+            for item in (issues_for_file or [])
+            if getattr(item, "rule", "")
+        ]
+
         prompt_input = {
-            "issue_rule": getattr(issue, "rule", ""),
-            "issue_message": getattr(issue, "message", ""),
+            "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
+            "issue_message": issues_block,
             "target_path": diff_path,
             "requester_context": context or "(Contexto indisponível)",
             "original_code": original_content,
@@ -140,6 +146,20 @@ class FixerAgent:
             if 'Arquivo alvo:' in line:
                 return line.split(':', 1)[1].strip()
         return ""
+
+    def _render_issue_list(self, issues: List) -> str:
+        if not issues:
+            return ""
+        lines: List[str] = []
+        for idx, item in enumerate(issues, start=1):
+            line = getattr(item, "line", None)
+            message = getattr(item, "message", "")
+            rule = getattr(item, "rule", "")
+            key = getattr(item, "key", f"ISSUE-{idx}")
+            lines.append(
+                f"{idx}. ({key}) Linha {line if line is not None else '?'} — {message} ({rule})"
+            )
+        return "\n".join(lines)
 
     def _resolve_file_path(self, reference: str) -> Optional[Path]:
         """Resolve file references relative to the configured repo root."""

@@ -1,10 +1,10 @@
-"""Requester agent: assembles rich context for the Fixer agent."""
+"""Requester agent: groups issues per file and builds rich context for the Fixer."""
 from __future__ import annotations
 
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from app.a2a.protocol import Issue, State
 from app.llm_client import LLMClient
@@ -12,13 +12,13 @@ from app.llm_client import LLMClient
 LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-Você é o Requester Agent em um fluxo AutoFix.
-Dado um issue do SonarQube e o conteúdo do arquivo envolvido, produza uma resposta extremamente concisa usando inglês.
-Organize a saída em no máximo três seções curtas:
-- Problem: descreva o bug em uma única frase clara.
-- Fix: explique em até duas frases objetivas o que precisa ser alterado.
-- Notes: inclua somente se houver feedback relevante do Tester ou do Sonar.
-Limite-se a ~120 palavras e evite redundâncias.
+You are the Requester Agent in an AutoFix pipeline.
+Given a list of SonarQube issues for a single file and the file contents, craft a concise English briefing.
+Structure the response with three short sections:
+- Overview: one sentence summarising the affected file and the number of issues.
+- Issues: bullet list where each item follows "Line <number>: <short description> (<rule>)".
+- Notes: include only if there is tester or sonar feedback worth highlighting.
+Keep the result under 150 words and avoid repetition.
 """
 
 
@@ -26,257 +26,210 @@ def _component_to_path(component: str) -> Optional[Path]:
     if ":" in component:
         _, rel = component.split(":", 1)
         return Path(rel)
-    return Path(component)
+    if component:
+        return Path(component)
+    return None
 
 
 class RequesterAgent:
+    """Aggregates multiple issues for a file and prepares Fixer context."""
+
     def __init__(self, temperature: float = 0.1, repo_root: Optional[Path] = None) -> None:
         self.llm = LLMClient(role="requester", temperature=temperature)
         env_root = os.getenv("A2A_REPO_ROOT")
         base = Path(repo_root) if repo_root else Path(env_root) if env_root else Path.cwd()
         self.repo_root = base.resolve()
         self.max_file_chars = int(os.getenv("REQUESTER_MAX_FILE_CHARS", "6000"))
-        self.context_radius = int(os.getenv("REQUESTER_CONTEXT_RADIUS", "120"))
-        self.max_context_chars = int(os.getenv("REQUESTER_MAX_CONTEXT_CHARS", "8000"))
+        self.max_context_chars = int(os.getenv("REQUESTER_MAX_CONTEXT_CHARS", "9000"))
         self._last_file_path: Optional[Path] = None
-        self._last_snippet: Optional[str] = None
 
+    # Public API ----------------------------------------------------------
     def invoke(self, state: State) -> State:
-        issue = state["issue"]
-        attempt = int(state.get("attempt", 1))
-        feedback_log = state.get("feedback_log", "")
+        issues = list(state.get("issues") or [])
+        if not issues:
+            LOGGER.info("Requester não encontrou issues pendentes")
+            state.update(
+                {
+                    "context": "No pending issues found by planner.",
+                    "multi_issue_summary": "",
+                }
+            )
+            return state
+
+        processed: set[str] = set(state.get("processed_components") or [])
+        component, grouped = self._select_component(issues, processed)
+        if component is None:
+            LOGGER.info("Requester: nenhum arquivo pendente após filtrar componentes processados")
+            state.update(
+                {
+                    "context": "All files have already been processed.",
+                    "multi_issue_summary": "",
+                }
+            )
+            return state
+
+        display_path, file_text = self._load_file(component)
+        summary_items = self._format_issue_list(grouped)
+        multi_issue_summary = "\n".join(summary_items)
+
         tester_feedback = state.get("tester_summary")
         sonar_feedback = state.get("sonar_summary")
 
-        module_issues = list(state.get("module_issues") or [])
+        prompt = self._build_prompt(display_path, grouped, file_text, tester_feedback, sonar_feedback)
+        llm_summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
 
-        prompt = self._build_prompt(
-            issue,
-            attempt,
-            feedback_log,
-            tester_feedback,
-            sonar_feedback,
-            module_issues,
+        context = self._build_context(
+            display_path,
+            grouped,
+            file_text,
+            llm_summary,
         )
-        summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
-        combined_context = self._build_concise_context(
-            issue,
-            attempt,
-            feedback_log,
-            tester_feedback,
-            sonar_feedback,
-            module_issues,
-            summary,
-        )
-        combined_context = self._truncate_context(combined_context)
 
-        state.update({
-            "context": combined_context,
-            "attempt": attempt,
-            "feedback_log": feedback_log,
-        })
-        if "patch" in state:
-            LOGGER.debug("Requester clearing stale patch before fixer run")
-            state.pop("patch")
+        processed.add(component)
+        state.update(
+            {
+                "issue": grouped[0],
+                "issues_for_file": grouped,
+                "file_path": display_path,
+                "context": self._truncate(context),
+                "multi_issue_summary": multi_issue_summary,
+                "processed_components": list(processed),
+            }
+        )
         return state
 
-    # Internal helpers -------------------------------------------------------
-    def _build_prompt(
-        self,
-        issue: Issue,
-        attempt: int,
-        feedback_log: str,
-        tester_feedback: Optional[str],
-        sonar_feedback: Optional[str],
-        module_issues: List[Issue],
-    ) -> str:
-        file_contents = self._load_file_snippet(issue)
-        path_hint = _component_to_path(issue.component)
-        target_path = self._format_target_path(path_hint)
-        module_block = self._format_module_issues(issue, module_issues)
-        lines = [
-            f"Tentativa: {attempt}",
-            f"Issue: {issue.severity} - {issue.rule}",
-            f"Local: {issue.component}:{issue.line}",
-            (f"Arquivo alvo: {target_path}" if target_path else ""),
-            f"Mensagem: {issue.message}",
-            f"Feedback acumulado: {feedback_log or 'N/A'}",
-            f"Feedback tester: {tester_feedback or 'N/A'}",
-            f"Feedback sonar: {sonar_feedback or 'N/A'}",
-            ("Issues no mesmo módulo:\n" + module_block) if module_block else "",
-            "Arquivo:\n" + file_contents,
-        ]
-        return "\n".join(filter(None, lines))
+    # Internal helpers ----------------------------------------------------
+    def _select_component(
+        self, issues: Iterable[Issue], processed: set[str]
+    ) -> Tuple[Optional[str], List[Issue]]:
+        ordered = sorted(issues, key=lambda item: (item.component, item.line or 0, item.key))
+        for issue in ordered:
+            if issue.component in processed:
+                continue
+            component = issue.component
+            grouped = [candidate for candidate in ordered if candidate.component == component]
+            LOGGER.debug("Requester selecionou componente %s com %d issue(s)", component, len(grouped))
+            return component, grouped
+        return None, []
 
-    def _build_concise_context(
-        self,
-        issue: Issue,
-        attempt: int,
-        feedback_log: str,
-        tester_feedback: Optional[str],
-        sonar_feedback: Optional[str],
-        module_issues: List[Issue],
-        summary: str,
-    ) -> str:
-        target_path = self._format_target_path(_component_to_path(issue.component))
-        location = target_path or issue.component
-        if issue.line:
-            location = f"{location}:{issue.line}"
+    def _load_file(self, component: str) -> Tuple[str, str]:
+        path_hint = _component_to_path(component)
+        if not path_hint:
+            LOGGER.warning("Requester: componente %s sem caminho identificável", component)
+            return component, "(Arquivo não encontrado)"
 
-        def _clean(value: Optional[str]) -> Optional[str]:
-            if not value:
-                return None
-            cleaned = value.strip()
-            if not cleaned or cleaned.upper() == "N/A":
-                return None
-            return cleaned
-
-        parts: List[str] = [
-            f"Attempt {attempt}",
-            f"Issue {issue.key}: {issue.rule} ({issue.severity})",
-            f"Location: {location}",
-            f"Message: {issue.message.strip()}",
-        ]
-        if target_path:
-            parts.append(f"Arquivo alvo: {target_path}")
-
-        for label, value in (
-            ("Prior feedback", _clean(feedback_log)),
-            ("Tester feedback", _clean(tester_feedback)),
-            ("Sonar feedback", _clean(sonar_feedback)),
-        ):
-            if value:
-                parts.append(f"{label}: {value}")
-
-        module_block = self._format_module_issues(issue, module_issues)
-        if module_block:
-            parts.append("Issues no mesmo módulo:\n" + module_block)
-
-        snippet = (self._last_snippet or "").strip() or "(Trecho indisponível)"
-        summary_block = summary.strip()
-        if summary_block:
-            parts.append("Requester summary:\n" + summary_block)
-        parts.append("Code excerpt:\n" + snippet)
-        return "\n".join(parts)
-
-    def _load_file_snippet(self, issue: Issue) -> str:
-        self._last_file_path = None
-        self._last_snippet = None
-        path = _component_to_path(issue.component)
-        if not path:
-            missing = "(Arquivo não encontrado)"
-            self._last_snippet = missing
-            return missing
         candidates = self._candidate_roots()
         for root in candidates:
-            full_path = (root / path).resolve()
-            if not full_path.exists():
-                continue
-            try:
-                self._last_file_path = full_path
-                snippet = self._build_file_snippet(full_path.read_text(), issue.line)
-                self._last_snippet = snippet
-                return snippet
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.error("Failed to read %s: %s", full_path, exc)
-                self._last_file_path = None
-                error_msg = "(Erro ao ler arquivo)"
-                self._last_snippet = error_msg
-                return error_msg
-        LOGGER.warning(
-            "File for issue %s not found under roots: %s",
-            issue.key,
-            ", ".join(str(root) for root in candidates),
-        )
-        self._last_file_path = None
-        missing = "(Arquivo não encontrado)"
-        self._last_snippet = missing
-        return missing
+            candidate = (root / path_hint).resolve()
+            if candidate.exists():
+                try:
+                    text = candidate.read_text()
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.error("Falha ao ler %s: %s", candidate, exc)
+                    return self._display_path(candidate), "(Erro ao ler arquivo)"
+                self._last_file_path = candidate
+                trimmed = self._trim_file(text)
+                return self._display_path(candidate), trimmed
+
+        LOGGER.warning("Requester não encontrou o arquivo para componente %s", component)
+        return component, "(Arquivo não encontrado)"
 
     def _candidate_roots(self) -> List[Path]:
         roots: List[Path] = []
 
-        def _add(root: Optional[Path]) -> None:
-            if not root:
+        def _register(path: Optional[Path]) -> None:
+            if not path:
                 return
-            resolved = root.resolve()
+            resolved = path.resolve()
             if resolved not in roots:
                 roots.append(resolved)
 
-        _add(self.repo_root)
+        _register(self.repo_root)
         for parent in self.repo_root.parents:
-            _add(parent)
+            _register(parent)
         env_root = os.getenv("A2A_REPO_ROOT")
         if env_root:
-            _add(Path(env_root))
-        _add(Path.cwd())
+            _register(Path(env_root))
+        _register(Path.cwd())
         try:
-            _add(Path(__file__).resolve().parents[3])
+            _register(Path(__file__).resolve().parents[3])
         except IndexError:  # pragma: no cover - defensive guard
             pass
         return roots
 
-    def _format_target_path(self, path_hint: Optional[Path]) -> Optional[str]:
-        path = self._last_file_path
-        if path:
-            try:
-                return path.relative_to(self.repo_root).as_posix()
-            except ValueError:
-                return path.as_posix()
-        if path_hint:
-            return path_hint.as_posix()
-        return None
+    def _trim_file(self, text: str) -> str:
+        if len(text) <= self.max_file_chars:
+            return text
+        LOGGER.debug("Requester truncating file content from %d chars", len(text))
+        return text[: self.max_file_chars] + "\n... (conteúdo truncado)"
 
-    def _format_module_issues(self, current: Issue, module_issues: List[Issue]) -> Optional[str]:
-        if not module_issues:
-            return None
+    def _display_path(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.repo_root).as_posix()
+        except ValueError:
+            return path.as_posix()
 
-        seen_keys: set[str] = set()
+    def _format_issue_list(self, issues: Iterable[Issue]) -> List[str]:
         rows: List[str] = []
-        for item in sorted(
-            module_issues,
-            key=lambda issue: ((issue.line is None), issue.line or 0, issue.key),
-        ):
-            if item.key in seen_keys:
-                continue
-            seen_keys.add(item.key)
-            tag = " (current)" if item.key == current.key else ""
-            location = item.line if item.line is not None else "?"
-            message = " ".join(item.message.split())
-            if len(message) > 160:
-                message = message[:157].rstrip() + "..."
-            rows.append(
-                f"- {item.key}{tag}: {item.rule} (line {location}) — {message}"
+        for idx, issue in enumerate(issues, start=1):
+            line = issue.line if issue.line is not None else "?"
+            message = " ".join(issue.message.split())
+            rows.append(f"{idx}. [{issue.key}] Linha {line} — {message} ({issue.rule})")
+        return rows
+
+    def _build_prompt(
+        self,
+        file_path: str,
+        issues: List[Issue],
+        file_text: str,
+        tester_feedback: Optional[str],
+        sonar_feedback: Optional[str],
+    ) -> str:
+        issue_lines = "\n".join(self._format_issue_list(issues))
+        feedback_lines = []
+        if tester_feedback:
+            feedback_lines.append(f"Tester feedback: {tester_feedback.strip()}")
+        if sonar_feedback:
+            feedback_lines.append(f"Sonar feedback: {sonar_feedback.strip()}")
+        feedback_block = "\n".join(feedback_lines) if feedback_lines else ""
+        return "\n".join(
+            filter(
+                None,
+                (
+                    f"Target file: {file_path}",
+                    f"Issues detected ({len(issues)}):\n{issue_lines}",
+                    feedback_block,
+                    "File contents:\n" + file_text,
+                ),
             )
+        )
 
-        if len(seen_keys) <= 1:
-            return None
-        return "\n".join(rows)
+    def _build_context(
+        self,
+        file_path: str,
+        issues: List[Issue],
+        file_text: str,
+        llm_summary: str,
+    ) -> str:
+        lines = [
+            f"Arquivo alvo: {file_path}",
+            f"Total de issues: {len(issues)}",
+        ]
+        lines.extend(self._format_issue_list(issues))
+        if llm_summary.strip():
+            lines.append("Requester summary:\n" + llm_summary.strip())
+        lines.append("Código completo:\n" + file_text)
+        return "\n".join(lines)
 
-    def _build_file_snippet(self, file_text: str, line: Optional[int]) -> str:
-        if len(file_text) <= self.max_file_chars:
-            return file_text
-        lines = file_text.splitlines()
-        total_lines = len(lines)
-        if line and 1 <= line <= total_lines:
-            idx = line - 1
-            radius = max(0, self.context_radius)
-            start = max(0, idx - radius)
-            end = min(total_lines, idx + radius + 1)
-            snippet_lines = lines[start:end]
-            snippet = "\n".join(snippet_lines)
-            header = f"... (trecho de linhas {start + 1}-{end} de {total_lines})\n"
-            footer = "\n... (conteúdo truncado; veja o arquivo completo no repositório)"
-            result = header + snippet + footer
-        else:
-            result = file_text[: self.max_file_chars]
-            result += "\n... (conteúdo truncado; veja o arquivo completo no repositório)"
-        if len(result) > self.max_file_chars:
-            result = result[: self.max_file_chars] + "\n... (trecho truncado)"
-        return result
+    def _truncate(self, text: str) -> str:
+        if len(text) <= self.max_context_chars:
+            return text
+        LOGGER.debug(
+            "Requester truncating context from %d to %d chars",
+            len(text),
+            self.max_context_chars,
+        )
+        return text[: self.max_context_chars] + "\n... (contexto truncado)"
 
-    def _truncate_context(self, context: str) -> str:
-        if len(context) <= self.max_context_chars:
-            return context
-        truncated = context[: self.max_context_chars]
-        return truncated + "\n... (contexto adicional truncado)"
+
+__all__ = ["RequesterAgent"]
