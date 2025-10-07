@@ -34,8 +34,8 @@ class TesterAgent:
             )
         except FileNotFoundError as exc:
             missing = command[0]
-            message = f"Falha: comando '{missing}' não encontrado ({exc})."
-            LOGGER.error(message)
+            message = f"Comando '{missing}' não encontrado; lint será pulado. Detalhes: {exc}"
+            LOGGER.info(message)
             return False, message, True
         output = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode == 0, output, False

@@ -64,7 +64,7 @@ class ExecutorAgent:
     # Helpers --------------------------------------------------------------
     def _build_command(self, patch: str) -> list[str]:
         if not self.docker_image:
-            LOGGER.warning("AUTOFIX_DOCKER_IMAGE não definido; usando execução local")
+            LOGGER.info("AUTOFIX_DOCKER_IMAGE não definido; executando testes localmente")
             return self._local_command(patch)
 
         script = (
