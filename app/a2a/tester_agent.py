@@ -25,12 +25,18 @@ class TesterAgent:
 
     def _run_command(self, command: List[str]) -> Tuple[bool, str]:
         LOGGER.debug("Tester executando comando: %s", command)
-        proc = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            missing = command[0]
+            message = f"Falha: comando '{missing}' não encontrado ({exc})."
+            LOGGER.error(message)
+            return False, message
         output = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode == 0, output
 

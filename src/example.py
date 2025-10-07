@@ -1,7 +1,6 @@
 def vulnerable_function(user_input):
     # This function has security issues for SonarQube to detect
     if user_input == "admin":
-        password = "123456"  # Hardcoded password
         return True
     else:
         return False
