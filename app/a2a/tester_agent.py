@@ -23,7 +23,7 @@ class TesterAgent:
     def __init__(self, temperature: float = 0.0) -> None:
         self.llm = LLMClient(role="tester", temperature=temperature)
 
-    def _run_command(self, command: List[str]) -> Tuple[bool, str]:
+    def _run_command(self, command: List[str]) -> Tuple[bool, str, bool]:
         LOGGER.debug("Tester executando comando: %s", command)
         try:
             proc = subprocess.run(
@@ -36,14 +36,19 @@ class TesterAgent:
             missing = command[0]
             message = f"Falha: comando '{missing}' não encontrado ({exc})."
             LOGGER.error(message)
-            return False, message
+            return False, message, True
         output = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode == 0, output
+        return proc.returncode == 0, output, False
 
     def run_suite(self) -> Tuple[bool, bool, str]:
-        pytest_ok, pytest_logs = self._run_command(["pytest", "-q", "--disable-warnings"])
-        ruff_ok, ruff_logs = self._run_command(["ruff", "check", "."])
-        black_ok, black_logs = self._run_command(["black", "--check", "."])
+        pytest_ok, pytest_logs, pytest_missing = self._run_command(["pytest", "-q", "--disable-warnings"])
+        ruff_ok, ruff_logs, ruff_missing = self._run_command(["ruff", "check", "."])
+        black_ok, black_logs, black_missing = self._run_command(["black", "--check", "."])
+
+        if ruff_missing:
+            ruff_logs = (ruff_logs.strip() + "\nComando ausente; lint pulado.").strip()
+        if black_missing:
+            black_logs = (black_logs.strip() + "\nComando ausente; lint pulado.").strip()
 
         aggregate_logs = "\n\n".join(
             [
@@ -53,7 +58,10 @@ class TesterAgent:
             ]
         ).strip()
 
-        lint_passed = ruff_ok and black_ok
+        lint_passed = (ruff_ok or ruff_missing) and (black_ok or black_missing)
+        if pytest_missing:
+            LOGGER.error("Pytest não está disponível; marcando suíte como falha.")
+            pytest_ok = False
         return pytest_ok, lint_passed, aggregate_logs
 
     def invoke(self, state: State) -> State:

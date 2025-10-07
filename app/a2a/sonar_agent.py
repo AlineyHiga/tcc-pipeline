@@ -13,7 +13,18 @@ LOGGER = logging.getLogger(__name__)
 
 def invoke(state: State) -> State:
     LOGGER.info("Sonar agent executando nova análise")
-    run_sonar_scanner()
+    try:
+        run_sonar_scanner()
+    except RuntimeError as exc:
+        message = f"Falha ao executar sonar-scanner: {exc}"
+        LOGGER.error(message)
+        state.update(
+            {
+                "sonar_passed": False,
+                "sonar_summary": message,
+            }
+        )
+        return state
     client = SonarQubeClient()
     issues = client.search_issues()
 

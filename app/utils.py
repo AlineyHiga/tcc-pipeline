@@ -1,4 +1,3 @@
-
 """Utility helpers for the AutoFix pipeline."""
 from __future__ import annotations
 
@@ -22,13 +21,41 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
-    scanner_path = shutil.which("sonar-scanner")
+    scanner_candidates: list[Path] = []
+    explicit_bin = env.get("SONAR_SCANNER_BIN") or os.getenv("SONAR_SCANNER_BIN")
+    if explicit_bin:
+        scanner_candidates.append(Path(explicit_bin))
+
+    system_binary = shutil.which("sonar-scanner")
+    if system_binary:
+        scanner_candidates.append(Path(system_binary))
+
+    repo_root = Path(__file__).resolve().parents[2]
+    bundled_binary = repo_root / "sonar-scanner-5.0.1.3006-linux" / "bin" / "sonar-scanner"
+    if bundled_binary.exists():
+        scanner_candidates.append(bundled_binary)
+
+    scanner_path: Optional[Path] = None
+    for candidate in scanner_candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            scanner_path = candidate
+            break
+
     if scanner_path:
-        cmd = [scanner_path]
+        LOGGER.info("Usando sonar-scanner localizado em %s", scanner_path)
+        cmd = [str(scanner_path)]
     else:
-        LOGGER.info("sonar-scanner not found, falling back to Docker image")
+        docker_path = shutil.which("docker")
+        if not docker_path:
+            message = (
+                "Não foi possível localizar o binário sonar-scanner nem Docker. "
+                "Instale o sonar-scanner ou habilite Docker para executar a análise."
+            )
+            LOGGER.error(message)
+            raise RuntimeError(message)
+        LOGGER.info("sonar-scanner não encontrado; executando via imagem Docker oficial")
         cmd = [
-            "docker",
+            docker_path,
             "run",
             "--rm",
             "--network=host",
@@ -49,10 +76,20 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
     LOGGER.info("Project key: %s", env.get('SONAR_PROJECT_KEY'))
     LOGGER.info("SonarQube URL: %s", env.get('SONARQUBE_URL'))
     LOGGER.debug("Executing command: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, cwd=str(cwd), env=env, capture_output=True, check=False)
+    proc = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     if proc.returncode != 0:
-        LOGGER.error("Sonar scanner failed: %s", proc.stderr.decode())
-        raise RuntimeError(proc.stderr.decode())
+        stderr = proc.stderr.strip()
+        stdout = proc.stdout.strip()
+        combined = "\n".join(part for part in [stdout, stderr] if part).strip()
+        LOGGER.error("Sonar scanner failed: %s", combined or "(sem saída)")
+        raise RuntimeError(combined or "sonar-scanner retornou código não zero")
     LOGGER.info("Sonar scanner completed successfully")
 
 
