@@ -33,6 +33,7 @@ class FixerAgent:
         repo_root: Optional[Union[Path, str]] = None,
     ) -> None:
         self.llm = LLMClient(role="fixer", temperature=temperature)
+        self.max_attempts = max(1, int(os.getenv("FIXER_MAX_ATTEMPTS", "2")))
         env_root = os.getenv("A2A_REPO_ROOT")
         if repo_root:
             base = Path(repo_root)
@@ -52,6 +53,7 @@ class FixerAgent:
                     "Arquivo: {target_path}\n"
                     "Contexto adicional:\n{requester_context}\n\n"
                     "Código original:\n{original_code}\n\n"
+                    "{retry_note}"
                     "Retorne apenas um bloco ```python``` contendo o arquivo completo com as correções aplicadas.",
                 )
             ]
@@ -91,39 +93,61 @@ class FixerAgent:
             if getattr(item, "rule", "")
         ]
 
-        prompt_input = {
-            "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
-            "issue_message": issues_block,
-            "target_path": diff_path,
-            "requester_context": context or "(Contexto indisponível)",
-            "original_code": original_content,
-        }
-        prompt_value = self.prompt.format_prompt(**prompt_input)
-        user_prompt = prompt_value.to_messages()[0].content
-        LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
-        raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
-        LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
-        fixed_content = raw_response.strip()
-        LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
+        patch = ""
+        retry_note = ""
+        attempts_used = 0
+        for attempt in range(1, self.max_attempts + 1):
+            attempts_used = attempt
+            LOGGER.info("Fixer attempt %d/%d for %s", attempt, self.max_attempts, diff_path)
+            prompt_input = {
+                "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
+                "issue_message": issues_block,
+                "target_path": diff_path,
+                "requester_context": context or "(Contexto indisponível)",
+                "original_code": original_content,
+                "retry_note": retry_note,
+            }
+            prompt_value = self.prompt.format_prompt(**prompt_input)
+            user_prompt = prompt_value.to_messages()[0].content
+            LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
+            raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
+            LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
+            fixed_content = raw_response.strip()
+            LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
 
-        # Limpa resposta de cercas de código ou prefixos
-        fixed_content = self._clean_code_response(fixed_content)
-        LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
+            fixed_content = self._clean_code_response(fixed_content)
+            LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
 
-        # Se o LLM retornou um diff parcial (sem header git), sanitiza antes
-        if self._looks_like_diff_response(fixed_content):
-            LOGGER.warning("Fixer detected diff-like output, sanitizing.")
-            fixed_content = self._sanitize_diff_like_response(
-                fixed_content, diff_path, original_content
+            if self._looks_like_diff_response(fixed_content):
+                LOGGER.warning("Fixer detected diff-like output, sanitizing.")
+                fixed_content = self._sanitize_diff_like_response(
+                    fixed_content, diff_path, original_content
+                )
+
+            candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
+            LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
+            LOGGER.debug("Generated patch size: %d chars", len(candidate_patch))
+
+            if candidate_patch and "@@" in candidate_patch:
+                patch = candidate_patch
+                break
+
+            log_method = LOGGER.warning if attempt < self.max_attempts else LOGGER.error
+            log_method(
+                "Fixer attempt %d/%d produced no valid patch for %s",
+                attempt,
+                self.max_attempts,
+                diff_path,
             )
+            if attempt < self.max_attempts:
+                retry_note = (
+                    "ATENÇÃO: a resposta anterior não gerou alterações. "
+                    "Reescreva o arquivo corrigindo explicitamente o problema reportado.\n\n"
+                )
 
-        # Gera diff unificado completo
-        patch = self._generate_patch(original_content, fixed_content, diff_path)
-        LOGGER.info("Generated patch (first 1k chars): %s", patch[:1000])
-        LOGGER.debug("Generated patch size: %d chars", len(patch))
         state["patch"] = patch
 
-        if not patch or "@@" not in patch:
+        if not patch:
             LOGGER.error("Fixer produced invalid patch for %s", diff_path)
             state.update({
                 "fixer_summary": "Falha ao gerar patch válido",
@@ -131,7 +155,11 @@ class FixerAgent:
             })
         else:
             state.update({
-                "fixer_summary": "Patch gerado com sucesso",
+                "fixer_summary": (
+                    "Patch gerado com sucesso"
+                    if attempts_used == 1
+                    else f"Patch gerado com sucesso após {attempts_used} tentativas"
+                ),
                 "fix_failed": False,
             })
 
