@@ -48,9 +48,26 @@ class RequesterAgent:
         tester_feedback = state.get("tester_summary")
         sonar_feedback = state.get("sonar_summary")
 
-        prompt = self._build_prompt(issue, attempt, feedback_log, tester_feedback, sonar_feedback)
+        module_issues = list(state.get("module_issues") or [])
+
+        prompt = self._build_prompt(
+            issue,
+            attempt,
+            feedback_log,
+            tester_feedback,
+            sonar_feedback,
+            module_issues,
+        )
         summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
-        combined_context = self._build_concise_context(issue, attempt, feedback_log, tester_feedback, sonar_feedback, summary)
+        combined_context = self._build_concise_context(
+            issue,
+            attempt,
+            feedback_log,
+            tester_feedback,
+            sonar_feedback,
+            module_issues,
+            summary,
+        )
         combined_context = self._truncate_context(combined_context)
 
         state.update({
@@ -71,10 +88,12 @@ class RequesterAgent:
         feedback_log: str,
         tester_feedback: Optional[str],
         sonar_feedback: Optional[str],
+        module_issues: List[Issue],
     ) -> str:
         file_contents = self._load_file_snippet(issue)
         path_hint = _component_to_path(issue.component)
         target_path = self._format_target_path(path_hint)
+        module_block = self._format_module_issues(issue, module_issues)
         lines = [
             f"Tentativa: {attempt}",
             f"Issue: {issue.severity} - {issue.rule}",
@@ -84,6 +103,7 @@ class RequesterAgent:
             f"Feedback acumulado: {feedback_log or 'N/A'}",
             f"Feedback tester: {tester_feedback or 'N/A'}",
             f"Feedback sonar: {sonar_feedback or 'N/A'}",
+            ("Issues no mesmo módulo:\n" + module_block) if module_block else "",
             "Arquivo:\n" + file_contents,
         ]
         return "\n".join(filter(None, lines))
@@ -95,6 +115,7 @@ class RequesterAgent:
         feedback_log: str,
         tester_feedback: Optional[str],
         sonar_feedback: Optional[str],
+        module_issues: List[Issue],
         summary: str,
     ) -> str:
         target_path = self._format_target_path(_component_to_path(issue.component))
@@ -126,6 +147,10 @@ class RequesterAgent:
         ):
             if value:
                 parts.append(f"{label}: {value}")
+
+        module_block = self._format_module_issues(issue, module_issues)
+        if module_block:
+            parts.append("Issues no mesmo módulo:\n" + module_block)
 
         snippet = (self._last_snippet or "").strip() or "(Trecho indisponível)"
         summary_block = summary.strip()
@@ -201,6 +226,32 @@ class RequesterAgent:
         if path_hint:
             return path_hint.as_posix()
         return None
+
+    def _format_module_issues(self, current: Issue, module_issues: List[Issue]) -> Optional[str]:
+        if not module_issues:
+            return None
+
+        seen_keys: set[str] = set()
+        rows: List[str] = []
+        for item in sorted(
+            module_issues,
+            key=lambda issue: ((issue.line is None), issue.line or 0, issue.key),
+        ):
+            if item.key in seen_keys:
+                continue
+            seen_keys.add(item.key)
+            tag = " (current)" if item.key == current.key else ""
+            location = item.line if item.line is not None else "?"
+            message = " ".join(item.message.split())
+            if len(message) > 160:
+                message = message[:157].rstrip() + "..."
+            rows.append(
+                f"- {item.key}{tag}: {item.rule} (line {location}) — {message}"
+            )
+
+        if len(seen_keys) <= 1:
+            return None
+        return "\n".join(rows)
 
     def _build_file_snippet(self, file_text: str, line: Optional[int]) -> str:
         if len(file_text) <= self.max_file_chars:

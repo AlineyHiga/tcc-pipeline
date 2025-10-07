@@ -1,19 +1,15 @@
-"""Sample module used by the AutoFix pipeline."""
-from __future__ import annotations
+"""Compatibility wrapper that re-exports the public helpers from `src`."""
 
-from typing import Iterable
+from src.sample_module import (  # type: ignore[F401]
+    Calculator,
+    divide_numbers,
+    safe_divide,
+    sum_non_negative,
+)
 
-
-def safe_divide(a: float, b: float) -> float:
-    """Return a / b protecting against division by zero."""
-    if b == 0:
-        return float("inf")
-    return a / b
-
-
-def sum_non_negative(values: Iterable[float]) -> float:
-    """Sum values but treat negatives as zero (idempotent example)."""
-    total = 0.0
-    for value in values:
-        total += value if value >= 0 else 0.0
-    return total
+__all__ = [
+    "Calculator",
+    "divide_numbers",
+    "safe_divide",
+    "sum_non_negative",
+]

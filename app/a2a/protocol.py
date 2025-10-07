@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional, TypedDict
+from typing import List, Literal, Optional, TypedDict
 
 
 @dataclass
@@ -20,6 +20,7 @@ class State(TypedDict, total=False):
     context: str
     patch: str
     attempt: int
+    module_issues: List[Issue]
     fixer_summary: str
     deployment_summary: str
     tester_summary: str

@@ -23,8 +23,227 @@ _SANITIZE_STRIP_TOKENS = {
     "Patch:",
 }
 
+_METADATA_PREFIXES = (
+    "index ",
+    "new file mode ",
+    "deleted file mode ",
+    "old mode ",
+    "new mode ",
+    "similarity index ",
+    "rename from ",
+    "rename to ",
+    "copy from ",
+    "copy to ",
+)
 
-def _sanitize_diff(raw_diff: str) -> str:
+
+def _component_to_path(component: Optional[str]) -> Optional[str]:
+    if not component:
+        return None
+    if ":" in component:
+        _, rel = component.split(":", 1)
+    else:
+        rel = component
+    rel = rel.strip()
+    if not rel:
+        return None
+    return rel.replace("\\", "/")
+
+
+def _derive_fallback_path(issue: Optional[object], repo_root: Path) -> Optional[str]:
+    if issue is None:
+        return None
+    component = getattr(issue, "component", None)
+    rel = _component_to_path(component)
+    if not rel:
+        return None
+    candidate = Path(rel)
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+    else:
+        resolved = (repo_root / candidate).resolve()
+    try:
+        return resolved.relative_to(repo_root).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _normalize_candidate_path(value: Optional[str], repo_root: Optional[Path]) -> Optional[str]:
+    if not value:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if stripped == "/dev/null":
+        return "/dev/null"
+    normalized = stripped.replace("\\", "/")
+    if normalized.startswith("a/") or normalized.startswith("b/"):
+        normalized = normalized[2:]
+    normalized = normalized.lstrip("./")
+    if repo_root:
+        candidate_path = Path(normalized)
+        if candidate_path.is_absolute():
+            resolved = candidate_path.resolve()
+        else:
+            resolved = (repo_root / normalized).resolve()
+        try:
+            return resolved.relative_to(repo_root).as_posix()
+        except ValueError:
+            return resolved.as_posix()
+    return normalized
+
+
+def _format_old_line(
+    raw_value: Optional[str],
+    file_path: str,
+    has_deletions: bool,
+    repo_root: Optional[Path],
+) -> str:
+    normalized = _normalize_candidate_path(raw_value, repo_root)
+    if normalized == "/dev/null" or (normalized is None and not has_deletions):
+        return "--- /dev/null"
+    return f"--- a/{normalized or file_path}"
+
+
+def _format_new_line(
+    raw_value: Optional[str],
+    file_path: str,
+    has_additions: bool,
+    repo_root: Optional[Path],
+) -> str:
+    normalized = _normalize_candidate_path(raw_value, repo_root)
+    if normalized == "/dev/null" or (normalized is None and not has_additions):
+        return "+++ /dev/null"
+    return f"+++ b/{normalized or file_path}"
+
+
+def _select_file_path(
+    new_path: Optional[str],
+    old_path: Optional[str],
+    fallback_path: Optional[str],
+    repo_root: Optional[Path],
+) -> Optional[str]:
+    for candidate in (new_path, old_path, fallback_path):
+        normalized = _normalize_candidate_path(candidate, repo_root)
+        if normalized and normalized != "/dev/null":
+            return normalized
+    return None
+
+
+def _is_metadata_line(value: str) -> bool:
+    stripped = value.lstrip()
+    return any(stripped.startswith(prefix) for prefix in _METADATA_PREFIXES)
+
+
+def _build_block(
+    block_lines: List[str],
+    repo_root: Optional[Path],
+    fallback_path: Optional[str],
+) -> List[str]:
+    if not block_lines:
+        return []
+
+    idx = 0
+    metadata: List[str] = []
+    while idx < len(block_lines) and not block_lines[idx].startswith("--- "):
+        metadata.append(block_lines[idx])
+        idx += 1
+
+    if idx >= len(block_lines):
+        raise PatchApplicationError(
+            "Bloco de diff sem linha inicial '---' não pôde ser interpretado"
+        )
+
+    old_line = block_lines[idx]
+    idx += 1
+    new_line: Optional[str] = None
+    if idx < len(block_lines) and block_lines[idx].startswith("+++ "):
+        new_line = block_lines[idx]
+        idx += 1
+
+    body = block_lines[idx:]
+    has_additions = any(line.startswith("+") and not line.startswith("+++") for line in body)
+    has_deletions = any(line.startswith("-") and not line.startswith("---") for line in body)
+
+    old_path_raw = old_line[4:].strip()
+    new_path_raw = new_line[4:].strip() if new_line else None
+
+    file_path = _select_file_path(new_path_raw, old_path_raw, fallback_path, repo_root)
+    if not file_path:
+        raise PatchApplicationError(
+            "Diff do Fixer não contém header `diff --git` e arquivo alvo não pôde ser inferido"
+        )
+
+    header = f"diff --git a/{file_path} b/{file_path}"
+    formatted_old = _format_old_line(old_path_raw, file_path, has_deletions, repo_root)
+    formatted_new = _format_new_line(new_path_raw, file_path, has_additions, repo_root)
+
+    result: List[str] = [header]
+    result.extend(metadata)
+    result.append(formatted_old)
+    result.append(formatted_new)
+    result.extend(body)
+    return result
+
+
+def _reconstruct_headers(
+    lines: List[str],
+    repo_root: Optional[Path],
+    fallback_path: Optional[str],
+) -> str:
+    if not lines:
+        raise PatchApplicationError("Diff vazio recebido do Fixer")
+
+    result: List[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if not line.strip():
+            result.append(line)
+            i += 1
+            continue
+        if line.startswith("--- "):
+            metadata_prefix: List[str] = []
+            while result and _is_metadata_line(result[-1]):
+                metadata_prefix.insert(0, result.pop())
+            block: List[str] = metadata_prefix
+            while i < len(lines) and not (
+                lines[i].startswith("diff --git ") or (i != 0 and lines[i].startswith("--- "))
+            ):
+                block.append(lines[i])
+                i += 1
+            block_result = _build_block(block, repo_root, fallback_path)
+            result.extend(block_result)
+            continue
+        if line.startswith("diff --git "):
+            result.extend(lines[i:])
+            break
+        result.append(line)
+        i += 1
+
+    if not any(item.startswith("diff --git ") for item in result):
+        normalized_fallback = _normalize_candidate_path(fallback_path, repo_root)
+        if not normalized_fallback or normalized_fallback == "/dev/null":
+            raise PatchApplicationError(
+                "Diff do Fixer não contém header `diff --git` e arquivo alvo não pôde ser inferido"
+            )
+        has_additions = any(
+            line.startswith("+") and not line.startswith("+++") for line in result
+        )
+        has_deletions = any(
+            line.startswith("-") and not line.startswith("---") for line in result
+        )
+        header_block = [
+            f"diff --git a/{normalized_fallback} b/{normalized_fallback}",
+            "--- /dev/null" if not has_deletions else f"--- a/{normalized_fallback}",
+            "+++ /dev/null" if not has_additions else f"+++ b/{normalized_fallback}",
+        ]
+        result = header_block + result
+
+    return "\n".join(result)
+
+
+def _sanitize_diff(raw_diff: str, repo_root: Path, fallback_path: Optional[str] = None) -> str:
     """Remove common artefacts that break unified diffs."""
 
     if not raw_diff or not raw_diff.strip():
@@ -41,10 +260,16 @@ def _sanitize_diff(raw_diff: str) -> str:
         lines.append(cleaned)
 
     sanitized = "\n".join(lines).strip()
-    header_idx = sanitized.find("diff --git")
-    if header_idx == -1:
-        raise PatchApplicationError("Diff do Fixer não contém header `diff --git`")
-    sanitized = sanitized[header_idx:]
+    line_list = sanitized.splitlines()
+    for idx, line in enumerate(line_list):
+        if line.startswith("diff --git "):
+            trimmed = "\n".join(line_list[idx:])
+            if not trimmed.endswith("\n"):
+                trimmed += "\n"
+            return trimmed
+
+    reconstructed = _reconstruct_headers(line_list, repo_root, fallback_path)
+    sanitized = reconstructed.strip()
     if not sanitized.endswith("\n"):
         sanitized += "\n"
     return sanitized
@@ -366,8 +591,13 @@ def apply_patch_node(state: State) -> State:
 
     LOGGER.info("Patch recebido do Fixer (primeiros 200 chars): %s", raw_patch[:200])
 
+    repo_root = Path(os.getenv("A2A_REPO_ROOT", Path.cwd())).resolve()
+    fallback_path = _derive_fallback_path(state.get("issue"), repo_root)
+    if fallback_path:
+        LOGGER.debug("Fallback de caminho do issue: %s", fallback_path)
+
     try:
-        sanitized = _sanitize_diff(raw_patch)
+        sanitized = _sanitize_diff(raw_patch, repo_root, fallback_path)
     except PatchApplicationError as exc:
         LOGGER.error("Diff inválido recebido do Fixer: %s", exc)
         state.update({
@@ -377,8 +607,6 @@ def apply_patch_node(state: State) -> State:
         return state
 
     LOGGER.debug("Diff sanitizado (primeiros 200 chars): %s", sanitized[:200])
-
-    repo_root = Path(os.getenv("A2A_REPO_ROOT", Path.cwd())).resolve()
 
     # First try: use unidiff + patch-ng (+ GitPython) if disponíveis
     rehydrated_for_patch_ng = sanitized

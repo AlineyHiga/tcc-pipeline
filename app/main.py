@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import List
+from collections import defaultdict
+from dataclasses import asdict, is_dataclass
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -133,7 +135,19 @@ def after_sonar_router(state: State) -> str:
     return "fixer"
 
 
-def run_graph_for_issue(issue: Issue) -> State:
+def _serialize_for_log(value: Any) -> Any:
+    if is_dataclass(value):
+        return asdict(value)
+    if isinstance(value, dict):
+        return {k: _serialize_for_log(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_serialize_for_log(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_serialize_for_log(item) for item in value)
+    return value
+
+
+def run_graph_for_issue(issue: Issue, module_issues: List[Issue]) -> State:
     builder = StateGraph(State)
     builder.add_node("requester", requester_node)
     builder.add_node("fixer", fixer_node)
@@ -163,14 +177,27 @@ def run_graph_for_issue(issue: Issue) -> State:
     builder.add_edge("deployment", END)
 
     graph = builder.compile(checkpointer=MemorySaver())
-    initial_state: State = {"issue": issue, "attempt": 1, "feedback_log": ""}
+    initial_state: State = {
+        "issue": issue,
+        "attempt": 1,
+        "feedback_log": "",
+        "module_issues": list(module_issues),
+    }
     config = {
         "configurable": {"thread_id": issue.key},
         "recursion_limit": max(25, MAX_ROUNDS * 10),
     }
     final_state: State = graph.invoke(initial_state, config=config)
     LOGGER.info("Pipeline finalizado para issue %s", issue.key)
-    LOGGER.debug("Estado final: %s", json.dumps({k: v for k, v in final_state.items() if k != "issue"}, ensure_ascii=False, indent=2))
+    serializable = {
+        k: _serialize_for_log(v)
+        for k, v in final_state.items()
+        if k != "issue"
+    }
+    LOGGER.debug(
+        "Estado final: %s",
+        json.dumps(serializable, ensure_ascii=False, indent=2),
+    )
     return final_state
 
 
@@ -180,10 +207,21 @@ def run_pipeline() -> List[State]:
     run_sonar_scanner()
     issues = client.search_issues(severities=ISSUE_SEVERITIES or None)
     LOGGER.info("%d issue(s) encontradas", len(issues))
+    grouped: Dict[str, List[SonarIssue]] = defaultdict(list)
+    for issue in issues:
+        grouped[issue.component].append(issue)
+    grouped_dataclass: Dict[str, List[Issue]] = {}
+    for component, component_issues in grouped.items():
+        ordered = sorted(
+            component_issues,
+            key=lambda item: ((item.line or 0), item.rule, item.key),
+        )
+        grouped_dataclass[component] = [sonar_issue_to_issue(item) for item in ordered]
     results: List[State] = []
     for issue in issues:
         LOGGER.info("Iniciando fluxo para %s", format_issue(issue).strip().replace("\n", " | "))
-        result = run_graph_for_issue(sonar_issue_to_issue(issue))
+        component_group = grouped_dataclass.get(issue.component, [])
+        result = run_graph_for_issue(sonar_issue_to_issue(issue), component_group)
         results.append(result)
     return results
 
