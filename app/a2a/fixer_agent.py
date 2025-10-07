@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import logging
 import os
 import re
@@ -117,6 +118,12 @@ class FixerAgent:
 
             fixed_content = self._clean_code_response(fixed_content)
             LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
+            if fixed_content:
+                preview = fixed_content[:200].replace("\n", "\\n")
+                LOGGER.debug("Sanitized fixer output preview: %s%s", preview, "..." if len(fixed_content) > 200 else "")
+            original_digest = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+            fixed_digest = hashlib.sha256(fixed_content.encode("utf-8")).hexdigest() if fixed_content else "EMPTY"
+            LOGGER.debug("Content digests — original=%s fixed=%s", original_digest, fixed_digest)
 
             if self._looks_like_diff_response(fixed_content):
                 LOGGER.warning("Fixer detected diff-like output, sanitizing.")
@@ -127,6 +134,10 @@ class FixerAgent:
             candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
             LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
             LOGGER.debug("Generated patch size: %d chars", len(candidate_patch))
+            if candidate_patch:
+                LOGGER.debug("Candidate patch line count: %d", candidate_patch.count("\n"))
+            else:
+                LOGGER.debug("Candidate patch empty for attempt %d on %s", attempt, diff_path)
 
             if candidate_patch and "@@" in candidate_patch:
                 patch = candidate_patch
