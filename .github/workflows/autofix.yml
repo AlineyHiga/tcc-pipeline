@@ -1,0 +1,34 @@
+name: AutoFix Pipeline
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autofix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build sandbox image
+        run: docker build -f tcc-pipeline/Dockerfile.autofix -t autofix:latest .
+      - name: Run AutoFix Pipeline
+        env:
+          AUTOFIX_DOCKER_IMAGE: autofix:latest
+          SONARQUBE_URL: ${{ secrets.SONARQUBE_URL }}
+          SONARQUBE_TOKEN: ${{ secrets.SONARQUBE_TOKEN }}
+          SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          A2A_REPO_ROOT: ${{ github.workspace }}/tcc-pipeline
+        run: |
+          cd tcc-pipeline
+          python -m app.main
