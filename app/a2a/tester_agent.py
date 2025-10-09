@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
-from typing import List, Tuple
+from pathlib import Path
+from typing import List, Optional, Tuple, Union
 
 from app.a2a.protocol import State
 from app.llm_client import LLMClient
@@ -20,17 +22,21 @@ Se todos passaram, apenas confirme a validação.
 
 
 class TesterAgent:
-    def __init__(self, temperature: float = 0.0) -> None:
+    def __init__(self, temperature: float = 0.0, repo_root: Optional[Union[Path, str]] = None) -> None:
         self.llm = LLMClient(role="tester", temperature=temperature)
+        root = repo_root or os.getenv("AUTOFIX_TARGET_ROOT") or os.getenv("A2A_REPO_ROOT") or Path.cwd()
+        self.repo_root = Path(root).expanduser().resolve()
+        LOGGER.debug("Tester repo root set to %s", self.repo_root)
 
     def _run_command(self, command: List[str]) -> Tuple[bool, str, bool]:
-        LOGGER.debug("Tester executando comando: %s", command)
+        LOGGER.debug("Tester executando comando: %s (cwd=%s)", command, self.repo_root)
         try:
             proc = subprocess.run(
                 command,
                 capture_output=True,
                 text=True,
                 check=False,
+                cwd=str(self.repo_root),
             )
         except FileNotFoundError as exc:
             missing = command[0]

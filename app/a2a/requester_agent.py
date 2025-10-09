@@ -23,12 +23,18 @@ Keep the result under 150 words and avoid repetition.
 
 
 def _component_to_path(component: str) -> Optional[Path]:
-    if ":" in component:
-        _, rel = component.split(":", 1)
-        return Path(rel)
-    if component:
-        return Path(component)
-    return None
+    cleaned = component.strip()
+    if not cleaned:
+        return None
+    cleaned = cleaned.replace("\\", "/")
+    if ":" in cleaned:
+        _, rel = cleaned.split(":", 1)
+    else:
+        rel = cleaned
+    rel = rel.lstrip("/")
+    if not rel:
+        return None
+    return Path(rel)
 
 
 class RequesterAgent:
@@ -131,6 +137,18 @@ class RequesterAgent:
                 trimmed = self._trim_file(text)
                 return self._display_path(candidate), trimmed
 
+        # Fallback for components that include extra directory prefixes.
+        fallback = self._search_by_suffix(candidates, path_hint)
+        if fallback:
+            try:
+                text = fallback.read_text()
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("Falha ao ler %s: %s", fallback, exc)
+                return self._display_path(fallback), "(Erro ao ler arquivo)"
+            self._last_file_path = fallback
+            trimmed = self._trim_file(text)
+            return self._display_path(fallback), trimmed
+
         LOGGER.warning("Requester não encontrou o arquivo para componente %s", component)
         return component, "(Arquivo não encontrado)"
 
@@ -156,6 +174,21 @@ class RequesterAgent:
         except IndexError:  # pragma: no cover - defensive guard
             pass
         return roots
+
+    def _search_by_suffix(self, roots: Iterable[Path], path_hint: Path) -> Optional[Path]:
+        parts = tuple(part for part in path_hint.parts if part not in {"", "."})
+        if not parts:
+            return None
+        for root in roots:
+            try:
+                for candidate in root.rglob(parts[-1]):
+                    rel_parts = candidate.relative_to(root).parts
+                    if len(rel_parts) >= len(parts) and tuple(rel_parts[-len(parts) :]) == parts:
+                        return candidate.resolve()
+            except (OSError, RuntimeError) as exc:  # noqa: BLE001
+                LOGGER.debug("Requester: falha ao buscar %s em %s (%s)", path_hint, root, exc)
+                continue
+        return None
 
     def _trim_file(self, text: str) -> str:
         if len(text) <= self.max_file_chars:

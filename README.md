@@ -63,6 +63,7 @@ cp .env.example .env  # e preencha os valores
 
 1. Suba o SonarQube (ex.: `docker run -d -p 9000:9000 sonarqube:community`).
 2. Configure tokens/variáveis (`SONARQUBE_URL`, `SONARQUBE_TOKEN`, `OPENAI_API_KEY` ou `LLM_LOCAL_MODEL_PATH`, `SONAR_PROJECT_KEY`).
+   - Para apontar a pipeline a um código hospedado fora de `tcc-pipeline`, defina `AUTOFIX_TARGET_ROOT` com o caminho absoluto do projeto (ex.: `AUTOFIX_TARGET_ROOT=/caminho/para/src/test-pipeline`). Esse valor é usado pelos agentes Fixer/Tester/Executor/Sonar e também pelo gerenciador de PRs.
 3. Rode uma análise inicial: `sonar-scanner`.
 4. Execute o pipeline:
 

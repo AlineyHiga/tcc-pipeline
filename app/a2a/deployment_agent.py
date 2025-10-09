@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 from dotenv import load_dotenv
 
@@ -51,6 +51,7 @@ class DeploymentAgent:
         base_branch: Optional[str] = None,
         repo: Optional[str] = None,
         token: Optional[str] = None,
+        repo_root: Optional[Union[Path, str]] = None,
     ) -> None:
         self.base_branch = base_branch or os.getenv("BASE_BRANCH", "main")
         self.repo = repo or os.getenv("GITHUB_REPOSITORY")
@@ -61,6 +62,9 @@ class DeploymentAgent:
             raise RuntimeError("GITHUB_TOKEN não configurado para DeploymentAgent")
 
         self.autobranch_prefix = os.getenv("AUTO_BRANCH_PREFIX", "autofix")
+        root = repo_root or os.getenv("AUTOFIX_TARGET_ROOT") or os.getenv("A2A_REPO_ROOT") or Path.cwd()
+        self.repo_root = Path(root).expanduser().resolve()
+        LOGGER.debug("Deployment repo root set to %s", self.repo_root)
 
         # LangChain components ------------------------------------------------
         openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -96,8 +100,8 @@ class DeploymentAgent:
         branch = state.get("branch") or f"{self.autobranch_prefix}/{issue.key}"
 
         LOGGER.info("Deployment agent preparando branch %s", branch)
-        ensure_git_branch(branch)
-        git_commit_all(f"fix: auto remediation for {issue.key}")
+        ensure_git_branch(branch, cwd=self.repo_root)
+        git_commit_all(f"fix: auto remediation for {issue.key}", cwd=self.repo_root)
 
         test_logs = (state.get("test_logs") or "(Testes não executados)").strip()
         if len(test_logs) > 2000:
@@ -288,7 +292,7 @@ class DeploymentAgent:
 
 
 def deployment_node(state: State) -> State:
-    agent = DeploymentAgent()
+    agent = DeploymentAgent(repo_root=state.get("repo_root"))
     return agent.invoke(state)
 
 

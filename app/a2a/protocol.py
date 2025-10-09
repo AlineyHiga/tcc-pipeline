@@ -19,6 +19,7 @@ class State(TypedDict, total=False):
     issue: Issue
     issues: List[Issue]
     issues_for_file: List[Issue]
+    repo_root: str
     plan_summary: str
     multi_issue_summary: str
     context: str

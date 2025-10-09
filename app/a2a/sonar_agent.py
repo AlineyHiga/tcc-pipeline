@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from pathlib import Path
 from typing import List
 
 from app.a2a.protocol import Issue, State
@@ -11,10 +13,17 @@ from app.utils import run_sonar_scanner
 LOGGER = logging.getLogger(__name__)
 
 
+def _resolve_repo_root(state: State) -> Path:
+    root = state.get("repo_root") or os.getenv("AUTOFIX_TARGET_ROOT") or os.getenv("A2A_REPO_ROOT") or Path.cwd()
+    return Path(root).expanduser().resolve()
+
+
 def invoke(state: State) -> State:
     LOGGER.info("Sonar agent executando nova análise")
+    repo_root = _resolve_repo_root(state)
+    LOGGER.debug("Sonar agent running with repo root %s", repo_root)
     try:
-        run_sonar_scanner()
+        run_sonar_scanner(cwd=repo_root)
     except RuntimeError as exc:
         message = f"Falha ao executar sonar-scanner: {exc}"
         LOGGER.error(message)
