@@ -128,6 +128,17 @@ def build_graph() -> StateGraph:
 
 
 def run_pipeline() -> State:
+    from app.utils import run_sonar_scanner
+    
+    # Execute sonar-scanner first
+    LOGGER.info("Executando sonar-scanner inicial")
+    try:
+        run_sonar_scanner()
+        LOGGER.info("Sonar-scanner executado com sucesso")
+    except Exception as e:
+        LOGGER.error("Falha no sonar-scanner: %s", e)
+        return {"error": str(e)}
+    
     graph_builder = build_graph()
     graph = graph_builder.compile(checkpointer=MemorySaver())
     LOGGER.info("Iniciando pipeline AutoFix")
