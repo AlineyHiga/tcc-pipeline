@@ -31,6 +31,8 @@ class ExecutorAgent:
             )
             return state
 
+        LOGGER.debug("Executor patch preview (first 500 chars):\n%s", patch[:500])
+
         LOGGER.info("Executor iniciando testes no sandbox Docker")
         command = self._build_command(patch)
         try:
@@ -50,7 +52,10 @@ class ExecutorAgent:
         LOGGER.info("Executor Docker finalizado (status=%s)", proc.returncode)
 
         if not success:
+            LOGGER.error("Executor falhou durante execução no Docker. Saída completa:\n%s", output.strip())
             self._revert_patch(patch)
+        else:
+            LOGGER.debug("Executor Docker output:\n%s", output.strip())
 
         state.update(
             {
@@ -70,9 +75,17 @@ class ExecutorAgent:
         script = (
             "set -euo pipefail\n"
             "cd /workspace\n"
-            "git apply - <<'AUTOFIX_PATCH'\n"
+            "patch_file=$(mktemp)\n"
+            "cat <<'AUTOFIX_PATCH' > \"$patch_file\"\n"
             f"{patch}\n"
             "AUTOFIX_PATCH\n"
+            "echo \"[executor] git apply --stat $patch_file\"\n"
+            "git apply --stat \"$patch_file\" || { echo \"[executor] git apply --stat failed\"; cat \"$patch_file\"; exit 1; }\n"
+            "echo \"[executor] git apply --check $patch_file\"\n"
+            "git apply --check \"$patch_file\" || { echo \"[executor] git apply --check failed\"; git apply --stat \"$patch_file\"; cat \"$patch_file\"; exit 1; }\n"
+            "echo \"[executor] git apply $patch_file\"\n"
+            "git apply \"$patch_file\" || { echo \"[executor] git apply failed\"; cat \"$patch_file\"; exit 1; }\n"
+            "rm \"$patch_file\"\n"
             "if [ -f requirements.txt ]; then pip install -r requirements.txt >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }; fi\n"
             "pytest -q\n"
         )
@@ -96,9 +109,17 @@ class ExecutorAgent:
     def _local_command(self, patch: str) -> list[str]:
         script = (
             "set -euo pipefail\n"
-            "git apply - <<'AUTOFIX_PATCH'\n"
+            "patch_file=$(mktemp)\n"
+            "cat <<'AUTOFIX_PATCH' > \"$patch_file\"\n"
             f"{patch}\n"
             "AUTOFIX_PATCH\n"
+            "echo \"[executor] git apply --stat $patch_file\"\n"
+            "git apply --stat \"$patch_file\" || { echo \"[executor] git apply --stat failed\"; cat \"$patch_file\"; exit 1; }\n"
+            "echo \"[executor] git apply --check $patch_file\"\n"
+            "git apply --check \"$patch_file\" || { echo \"[executor] git apply --check failed\"; git apply --stat \"$patch_file\"; cat \"$patch_file\"; exit 1; }\n"
+            "echo \"[executor] git apply $patch_file\"\n"
+            "git apply \"$patch_file\" || { echo \"[executor] git apply failed\"; cat \"$patch_file\"; exit 1; }\n"
+            "rm \"$patch_file\"\n"
             "if [ -f requirements.txt ]; then pip install -r requirements.txt >/tmp/pip.log 2>&1 || { cat /tmp/pip.log; exit 1; }; fi\n"
             "pytest -q\n"
         )
@@ -116,6 +137,10 @@ class ExecutorAgent:
         )
         output = (proc.stdout or "") + (proc.stderr or "")
         success = proc.returncode == 0
+        if not success:
+            LOGGER.error("Executor fallback local falhou. Saída completa:\n%s", output.strip())
+        else:
+            LOGGER.debug("Executor fallback local output:\n%s", output.strip())
         if not success:
             self._revert_patch(patch)
         state.update(

@@ -183,7 +183,9 @@ class RequesterAgent:
             try:
                 for candidate in root.rglob(parts[-1]):
                     rel_parts = candidate.relative_to(root).parts
-                    if len(rel_parts) >= len(parts) and tuple(rel_parts[-len(parts) :]) == parts:
+                    if not rel_parts:
+                        continue
+                    if tuple(rel_parts) == parts[-len(rel_parts) :]:
                         return candidate.resolve()
             except (OSError, RuntimeError) as exc:  # noqa: BLE001
                 LOGGER.debug("Requester: falha ao buscar %s em %s (%s)", path_hint, root, exc)

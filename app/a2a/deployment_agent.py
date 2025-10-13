@@ -11,7 +11,7 @@ from typing import Optional, Union
 from dotenv import load_dotenv
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.pydantic_v1 import BaseModel, Field
+from pydantic import BaseModel, Field
 from langchain_core.tools import StructuredTool
 from langchain_openai import ChatOpenAI
 

@@ -17,7 +17,12 @@ LOGGER = logging.getLogger(__name__)
 def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | Path = ".") -> None:
     """Execute `sonar-scanner` locally or via the official Docker image."""
     from dotenv import load_dotenv
-    load_dotenv()
+    repo_root = Path(__file__).resolve().parents[2]
+    root_env = repo_root / ".env"
+    local_env = repo_root / "tcc-pipeline" / ".env"
+    if root_env.exists():
+        load_dotenv(dotenv_path=root_env, override=False)
+    load_dotenv(dotenv_path=local_env, override=True)
     env = os.environ.copy()
     if extra_env:
         env.update(extra_env)
@@ -41,6 +46,43 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
             scanner_path = candidate
             break
 
+    property_args: list[str] = []
+    def _collect_property(prop: str, *env_keys: str) -> Optional[str]:
+        for key in env_keys:
+            value = env.get(key)
+            if value:
+                property_args.append(f"-D{prop}={value}")
+                return value
+        return None
+
+    sonar_url = env.get("SONARQUBE_URL") or env.get("SONAR_HOST_URL")
+    if not sonar_url:
+        raise RuntimeError(
+            "SONARQUBE_URL ou SONAR_HOST_URL não configurado. Defina o endpoint do SonarQube."
+        )
+
+    sonar_token = env.get("SONARQUBE_TOKEN") or env.get("SONAR_TOKEN")
+    if sonar_token:
+        env.setdefault("SONAR_TOKEN", sonar_token)
+
+    project_key = _collect_property("sonar.projectKey", "SONAR_PROJECT_KEY", "SONARQUBE_PROJECT_KEY")
+    if not project_key:
+        config_path = Path(cwd).resolve() / "sonar-project.properties"
+        if config_path.exists():
+            LOGGER.debug("Usando sonar-project.properties em %s para definir sonar.projectKey", config_path)
+        else:
+            raise RuntimeError(
+                "SONAR_PROJECT_KEY não definido e nenhum arquivo sonar-project.properties encontrado em "
+                f"{config_path}. Configure a chave do projeto antes de executar o scanner."
+            )
+    _collect_property("sonar.projectName", "SONAR_PROJECT_NAME", "SONARQUBE_PROJECT_NAME")
+    _collect_property("sonar.projectVersion", "SONAR_PROJECT_VERSION")
+    _collect_property("sonar.sources", "SONAR_SOURCES")
+    _collect_property("sonar.tests", "SONAR_TESTS")
+    _collect_property("sonar.language", "SONAR_LANGUAGE")
+    _collect_property("sonar.sourceEncoding", "SONAR_SOURCE_ENCODING")
+    _collect_property("sonar.host.url", "SONAR_HOST_URL", "SONARQUBE_URL")
+
     if scanner_path:
         LOGGER.info("Usando sonar-scanner localizado em %s", scanner_path)
         cmd = [str(scanner_path)]
@@ -54,13 +96,14 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
             LOGGER.error(message)
             raise RuntimeError(message)
         LOGGER.info("sonar-scanner não encontrado; executando via imagem Docker oficial")
+        sonar_host_for_container = sonar_url.replace("localhost", "host.docker.internal")
         cmd = [
             docker_path,
             "run",
             "--rm",
             "--network=host",
             "-e",
-            f"SONAR_HOST_URL={env.get('SONARQUBE_URL')}",
+            f"SONAR_HOST_URL={sonar_host_for_container}",
             "-e",
             f"SONAR_TOKEN={env.get('SONARQUBE_TOKEN')}",
             "-e",
@@ -73,8 +116,9 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
             f"{Path(cwd).resolve()}:/usr/src",
             "sonarsource/sonar-scanner-cli",
         ]
+    cmd.extend(property_args)
     LOGGER.info("Project key: %s", env.get('SONAR_PROJECT_KEY'))
-    LOGGER.info("SonarQube URL: %s", env.get('SONARQUBE_URL'))
+    LOGGER.info("SonarQube URL: %s", sonar_url)
     LOGGER.debug("Executing command: %s", " ".join(cmd))
     proc = subprocess.run(
         cmd,
