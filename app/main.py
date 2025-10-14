@@ -21,7 +21,13 @@ from app.a2a.requester_agent import RequesterAgent
 from app.a2a.sonar_agent import invoke as sonar_invoke
 from app.a2a.tester_agent import TesterAgent
 
-load_dotenv()
+_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+_LOCAL_ENV = Path(__file__).resolve().parents[1] / ".env"
+
+# Load root env first (project-level overrides) then pipeline-specific env.
+if _ROOT_ENV.exists():
+    load_dotenv(dotenv_path=_ROOT_ENV, override=False)
+load_dotenv(dotenv_path=_LOCAL_ENV, override=True)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -57,8 +63,8 @@ def _resolve_repo_root() -> Path:
     return default_root
 
 
-def build_graph() -> StateGraph:
-    repo_root = _resolve_repo_root()
+def build_graph(repo_root: Path | None = None) -> StateGraph:
+    repo_root = Path(repo_root).resolve() if repo_root else _resolve_repo_root()
     os.environ["A2A_REPO_ROOT"] = str(repo_root)
 
     requester = RequesterAgent(repo_root=repo_root)
@@ -128,7 +134,21 @@ def build_graph() -> StateGraph:
 
 
 def run_pipeline() -> State:
-    graph_builder = build_graph()
+    from app.utils import run_sonar_scanner
+    
+    repo_root = _resolve_repo_root()
+    os.environ["A2A_REPO_ROOT"] = str(repo_root)
+    
+    # Execute sonar-scanner first
+    LOGGER.info("Executando sonar-scanner inicial em %s", repo_root)
+    try:
+        run_sonar_scanner(cwd=repo_root)
+        LOGGER.info("Sonar-scanner executado com sucesso")
+    except Exception as e:
+        LOGGER.error("Falha no sonar-scanner: %s", e)
+        return {"error": str(e)}
+    
+    graph_builder = build_graph(repo_root=repo_root)
     graph = graph_builder.compile(checkpointer=MemorySaver())
     LOGGER.info("Iniciando pipeline AutoFix")
     final_state: State = graph.invoke({}, config={"configurable": {"thread_id": "autofix"}})

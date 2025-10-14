@@ -1,0 +1,15 @@
+@startuml
+skinparam ArrowColor #5b4ede
+skinparam ActivityBackgroundColor #f2f0ff
+skinparam ActivityBorderColor #5b4ede
+start
+start --> "planner"
+"executor" --> "tester"
+"fixer" --> "executor"
+"planner" --> "requester"
+"requester" --> "fixer"
+"sonar" --> "deployment"
+"tester" --> "sonar"
+"deployment" --> stop
+stop
+@enduml

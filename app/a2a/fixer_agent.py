@@ -1,11 +1,14 @@
 """Fixer agent: generates and applies patches based on Requester context."""
 from __future__ import annotations
 
+import ast
 import difflib
 import hashlib
 import logging
 import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Union
 
@@ -34,7 +37,6 @@ class FixerAgent:
         repo_root: Optional[Union[Path, str]] = None,
     ) -> None:
         self.llm = LLMClient(role="fixer", temperature=temperature)
-        self.max_attempts = max(1, int(os.getenv("FIXER_MAX_ATTEMPTS", "2")))
         env_root = os.getenv("A2A_REPO_ROOT")
         if repo_root:
             base = Path(repo_root)
@@ -54,7 +56,6 @@ class FixerAgent:
                     "Arquivo: {target_path}\n"
                     "Contexto adicional:\n{requester_context}\n\n"
                     "Código original:\n{original_code}\n\n"
-                    "{retry_note}"
                     "Retorne apenas um bloco ```python``` contendo o arquivo completo com as correções aplicadas.",
                 )
             ]
@@ -94,86 +95,95 @@ class FixerAgent:
             if getattr(item, "rule", "")
         ]
 
-        patch = ""
-        retry_note = ""
-        attempts_used = 0
-        for attempt in range(1, self.max_attempts + 1):
-            attempts_used = attempt
-            LOGGER.info("Fixer attempt %d/%d for %s", attempt, self.max_attempts, diff_path)
-            prompt_input = {
-                "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
-                "issue_message": issues_block,
-                "target_path": diff_path,
-                "requester_context": context or "(Contexto indisponível)",
-                "original_code": original_content,
-                "retry_note": retry_note,
-            }
-            prompt_value = self.prompt.format_prompt(**prompt_input)
-            user_prompt = prompt_value.to_messages()[0].content
-            LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
-            raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
-            LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
-            fixed_content = raw_response.strip()
-            LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
+        LOGGER.info("Fixer gerando patch único para %s", diff_path)
+        prompt_input = {
+            "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
+            "issue_message": issues_block,
+            "target_path": diff_path,
+            "requester_context": context or "(Contexto indisponível)",
+            "original_code": original_content,
+        }
+        prompt_value = self.prompt.format_prompt(**prompt_input)
+        user_prompt = prompt_value.to_messages()[0].content
+        LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
+        raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
+        LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
+        fixed_content = raw_response.strip()
+        LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
 
-            fixed_content = self._clean_code_response(fixed_content)
-            LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
-            if fixed_content:
-                preview = fixed_content[:200].replace("\n", "\\n")
-                LOGGER.debug("Sanitized fixer output preview: %s%s", preview, "..." if len(fixed_content) > 200 else "")
-            original_digest = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
-            fixed_digest = hashlib.sha256(fixed_content.encode("utf-8")).hexdigest() if fixed_content else "EMPTY"
-            LOGGER.debug("Content digests — original=%s fixed=%s", original_digest, fixed_digest)
+        fixed_content = self._clean_code_response(fixed_content)
+        LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
+        if fixed_content:
+            preview = fixed_content[:200].replace("\n", "\\n")
+            LOGGER.debug("Sanitized fixer output preview: %s%s", preview, "..." if len(fixed_content) > 200 else "")
+        original_digest = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+        fixed_digest = hashlib.sha256(fixed_content.encode("utf-8")).hexdigest() if fixed_content else "EMPTY"
+        LOGGER.debug("Content digests — original=%s fixed=%s", original_digest, fixed_digest)
 
-            if self._looks_like_diff_response(fixed_content):
-                LOGGER.warning("Fixer detected diff-like output, sanitizing.")
-                fixed_content = self._sanitize_diff_like_response(
-                    fixed_content, diff_path, original_content
-                )
-
-            candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
-            LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
-            LOGGER.debug("Generated patch size: %d chars", len(candidate_patch))
-            if candidate_patch:
-                LOGGER.debug("Candidate patch line count: %d", candidate_patch.count("\n"))
-            else:
-                LOGGER.debug("Candidate patch empty for attempt %d on %s", attempt, diff_path)
-
-            if candidate_patch and "@@" in candidate_patch:
-                patch = candidate_patch
-                break
-
-            log_method = LOGGER.warning if attempt < self.max_attempts else LOGGER.error
-            log_method(
-                "Fixer attempt %d/%d produced no valid patch for %s",
-                attempt,
-                self.max_attempts,
-                diff_path,
+        if self._looks_like_diff_response(fixed_content):
+            LOGGER.warning("Fixer detected diff-like output, sanitizing.")
+            fixed_content = self._sanitize_diff_like_response(
+                fixed_content, diff_path, original_content
             )
-            if attempt < self.max_attempts:
-                retry_note = (
-                    "ATENÇÃO: a resposta anterior não gerou alterações. "
-                    "Reescreva o arquivo corrigindo explicitamente o problema reportado.\n\n"
-                )
+            LOGGER.debug("Sanitized diff-like response size: %d chars", len(fixed_content))
 
-        state["patch"] = patch
+        is_valid_python, syntax_error = self._is_valid_python_code(fixed_content)
+        if not is_valid_python:
+            LOGGER.error(
+                "Fixer produced invalid Python source for %s: %s",
+                diff_path,
+                syntax_error or "syntax error",
+            )
+            state["patch"] = ""
+            state.update({
+                "fixer_summary": (
+                    f"Código inválido retornado pelo Fixer: {syntax_error}"
+                    if syntax_error
+                    else "Fixer retornou código inválido"
+                ),
+                "fix_failed": True,
+            })
+            return state
 
-        if not patch:
-            LOGGER.error("Fixer produced invalid patch for %s", diff_path)
+        candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
+        LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
+        LOGGER.debug("Generated patch size: %d chars", len(candidate_patch))
+        if candidate_patch:
+            LOGGER.debug("Candidate patch line count: %d", candidate_patch.count("\n"))
+        else:
+            LOGGER.debug("Candidate patch vazio para %s", diff_path)
+
+        if not candidate_patch or "@@" not in candidate_patch:
+            LOGGER.error("Generated patch missing diff hunks (@@) for %s", diff_path)
+            state["patch"] = ""
             state.update({
                 "fixer_summary": "Falha ao gerar patch válido",
                 "fix_failed": True,
             })
-        else:
+            return state
+
+        applies, patch_error = self._patch_applies(candidate_patch)
+        if not applies:
+            LOGGER.error(
+                "Generated patch failed to apply in dry-run for %s: %s",
+                diff_path,
+                patch_error or "git apply --check retornou código não zero",
+            )
+            state["patch"] = ""
             state.update({
                 "fixer_summary": (
-                    "Patch gerado com sucesso"
-                    if attempts_used == 1
-                    else f"Patch gerado com sucesso após {attempts_used} tentativas"
+                    "Falha ao validar patch: "
+                    f"{patch_error}" if patch_error else "Falha ao validar patch gerado"
                 ),
-                "fix_failed": False,
+                "fix_failed": True,
             })
+            return state
 
+        state["patch"] = candidate_patch
+        state.update({
+            "fixer_summary": "Patch gerado com sucesso",
+            "fix_failed": False,
+        })
         return state
 
     # ---------------------------------------------------------------------
@@ -320,8 +330,20 @@ class FixerAgent:
             return original
         return cleaned
 
+    def _is_valid_python_code(self, code: str) -> tuple[bool, str | None]:
+        """Return whether code is valid Python and, if not, the syntax error."""
+        if not code.strip():
+            return False, "resposta vazia"
+        try:
+            ast.parse(code)
+            return True, None
+        except SyntaxError as exc:
+            message = f"{exc.msg} (linha {exc.lineno}, coluna {exc.offset})"
+            LOGGER.debug("SyntaxError while parsing fixer output: %s", message)
+            return False, message
+
     def _generate_patch(self, original: str, fixed: str, file_path: str) -> str:
-        """Generate unified diff patch with guaranteed valid header."""
+        """Generate unified diff patch leveraging GitPython when available."""
         LOGGER.debug(
             "Generating patch for %s: original=%d chars fixed=%d chars",
             file_path,
@@ -332,6 +354,86 @@ class FixerAgent:
             LOGGER.warning("Fixer produced identical content or empty fix.")
             return ""
 
+        try:
+            return self._generate_patch_with_gitpython(original, fixed, file_path)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "GitPython falhou ao gerar diff para %s: %s. Recuando para difflib.",
+                file_path,
+                exc,
+            )
+            return self._generate_patch_with_difflib(original, fixed, file_path)
+
+    def _generate_patch_with_gitpython(self, original: str, fixed: str, file_path: str) -> str:
+        """Use GitPython (git diff --no-index) to produce a unified diff."""
+        try:
+            from git import Git  # lazy import to keep optional dependency
+        except ImportError as exc:  # pragma: no cover - handled by fallback
+            raise RuntimeError("GitPython não disponível") from exc
+
+        target_path = Path(file_path)
+        normalized_path = target_path.as_posix()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_root = Path(tmpdir)
+            original_rel = Path("orig") / target_path
+            fixed_rel = Path("new") / target_path
+            original_path = tmp_root / original_rel
+            fixed_path = tmp_root / fixed_rel
+            original_path.parent.mkdir(parents=True, exist_ok=True)
+            fixed_path.parent.mkdir(parents=True, exist_ok=True)
+            original_path.write_text(original, encoding="utf-8")
+            fixed_path.write_text(fixed, encoding="utf-8")
+
+            git_cli = Git(str(tmp_root))
+            cmd = [
+                "git",
+                "--no-pager",
+                "diff",
+                "--no-index",
+                "--text",
+                "--no-ext-diff",
+                "--color=never",
+                "--unified=3",
+                "--",
+                original_rel.as_posix(),
+                fixed_rel.as_posix(),
+            ]
+            status, stdout, stderr = git_cli.execute(
+                cmd,
+                with_extended_output=True,
+                with_exceptions=False,
+            )
+
+        status = int(str(status).strip())
+        if status not in (0, 1):
+            stderr_text = (stderr or "").strip()
+            raise RuntimeError(
+                f"git diff retornou status {status} ao gerar patch: {stderr_text or 'erro desconhecido'}"
+            )
+
+        diff_output = stdout or ""
+        if not diff_output.strip():
+            LOGGER.debug("git diff não encontrou mudanças entre snapshots para %s", file_path)
+            return ""
+
+        normalized_diff = diff_output.replace(
+            f"a/{original_rel.as_posix()}",
+            f"a/{normalized_path}",
+        ).replace(
+            f"b/{fixed_rel.as_posix()}",
+            f"b/{normalized_path}",
+        )
+        if not normalized_diff.endswith("\n"):
+            normalized_diff += "\n"
+        LOGGER.debug(
+            "GitPython generated diff for %s totals %d chars",
+            file_path,
+            len(normalized_diff),
+        )
+        return normalized_diff
+
+    def _generate_patch_with_difflib(self, original: str, fixed: str, file_path: str) -> str:
+        """Fallback unified diff generation using difflib."""
         original_lines = original.splitlines(keepends=True)
         fixed_lines = fixed.splitlines(keepends=True)
 
@@ -346,22 +448,44 @@ class FixerAgent:
         )
 
         if not diff_lines:
-            LOGGER.error("Unified diff generation returned empty output.")
+            LOGGER.error("Unified diff generation (difflib) returned empty output.")
             return ""
 
         header = f"diff --git a/{file_path} b/{file_path}\n"
         diff_text = "".join(diff_lines)
-        LOGGER.debug(
-            "Unified diff for %s has %d lines before header",
-            file_path,
-            len(diff_lines),
-        )
         if not diff_text.endswith("\n"):
             diff_text += "\n"
         full_diff = header + diff_text
         LOGGER.debug(
-            "Generated patch for %s totals %d chars",
+            "difflib generated diff for %s totals %d chars",
             file_path,
             len(full_diff),
         )
         return full_diff
+
+    def _patch_applies(self, patch: str) -> tuple[bool, Optional[str]]:
+        """Run git apply --check to verify patch validity without modifying files."""
+        if not patch.strip():
+            return False, "patch vazio"
+        tmp_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch") as handle:
+                handle.write(patch)
+                tmp_path = Path(handle.name)
+            result = subprocess.run(
+                ["git", "apply", "--check", str(tmp_path)],
+                cwd=str(self.repo_root),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                return True, None
+            combined = (result.stdout or "") + (result.stderr or "")
+            return False, combined.strip() or "git apply --check retornou código não zero"
+        finally:
+            if tmp_path and tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    LOGGER.debug("Não foi possível remover arquivo temporário %s", tmp_path)
