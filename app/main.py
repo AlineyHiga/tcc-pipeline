@@ -6,7 +6,7 @@ import logging
 import os
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 from langgraph.checkpoint.memory import MemorySaver
@@ -31,6 +31,8 @@ load_dotenv(dotenv_path=_LOCAL_ENV, override=True)
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+
+MAX_FEEDBACK_LOOPS = 2
 
 
 def _serialize(value: Any) -> Any:
@@ -89,6 +91,62 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
         state.setdefault("repo_root", repo_root.as_posix())
         return executor.invoke(state)
 
+    def feedback_node(state: State) -> State:
+        state.setdefault("repo_root", repo_root.as_posix())
+        execution_failed = state.get("execution_failed", False)
+        loops = state.get("feedback_loops", 0)
+        should_retry = False
+
+        if execution_failed:
+            if loops < MAX_FEEDBACK_LOOPS:
+                loops += 1
+                state["feedback_loops"] = loops
+                test_output = (state.get("test_output") or "").strip()
+                if not test_output:
+                    test_output = "Testes falharam, mas nenhuma saída foi capturada."
+                entry_header = f"Tentativa {loops} falhou"
+                new_entry = f"{entry_header}:\n{test_output}"
+                feedback_log = state.get("feedback_log") or ""
+                state["feedback_log"] = (
+                    f"{feedback_log}\n\n{new_entry}" if feedback_log else new_entry
+                )
+                LOGGER.info("Feedback loop #%d acionado após falha nos testes", loops)
+                state["tester_summary"] = test_output
+                processed = set(state.get("processed_components") or [])
+                current_issue = state.get("issue")
+                if current_issue and getattr(current_issue, "component", None) in processed:
+                    processed.discard(current_issue.component)
+                    LOGGER.debug(
+                        "Feedback loop removendo componente %s de processed_components",
+                        current_issue.component,
+                    )
+                state["processed_components"] = list(processed)
+                base_context = (state.get("context") or "").rstrip()
+                if base_context:
+                    base_context += "\n\n"
+                state["context"] = f"{base_context}[Feedback da tentativa {loops}]\n{test_output}"
+                state["patch"] = ""
+                should_retry = True
+            else:
+                limit_msg = "Limite de tentativas do feedback loop alcançado."
+                feedback_log = state.get("feedback_log") or ""
+                state["feedback_log"] = (
+                    f"{feedback_log}\n\n{limit_msg}" if feedback_log else limit_msg
+                )
+                LOGGER.info("Feedback loop atingiu o limite de %d tentativas", MAX_FEEDBACK_LOOPS)
+        else:
+            if loops:
+                LOGGER.debug("Feedback loop resetado após sucesso dos testes (antes=%d)", loops)
+            state["feedback_loops"] = 0
+            state["retry_requested"] = False
+            return state
+
+        state["retry_requested"] = should_retry
+        return state
+
+    def feedback_router(state: State) -> Literal["requester", "tester"]:
+        return "requester" if state.get("retry_requested") else "tester"
+
     def tester_node(state: State) -> State:
         state.setdefault("repo_root", repo_root.as_posix())
         if state.get("execution_failed"):
@@ -117,6 +175,7 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
     builder.add_node("requester", requester_node)
     builder.add_node("fixer", fixer_node)
     builder.add_node("executor", executor_node)
+    builder.add_node("feedback", feedback_node)
     builder.add_node("tester", tester_node)
     builder.add_node("sonar", sonar_node)
     builder.add_node("deployment", deployment_node)
@@ -125,7 +184,8 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
     builder.add_edge("planner", "requester")
     builder.add_edge("requester", "fixer")
     builder.add_edge("fixer", "executor")
-    builder.add_edge("executor", "tester")
+    builder.add_edge("executor", "feedback")
+    builder.add_conditional_edges("feedback", feedback_router)
     builder.add_edge("tester", "sonar")
     builder.add_edge("sonar", "deployment")
     builder.add_edge("deployment", END)

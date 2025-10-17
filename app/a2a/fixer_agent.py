@@ -20,13 +20,13 @@ from app.llm_client import LLMClient
 LOGGER = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """
-Você é o Fixer Agent. Receba o contexto preparado pelo Requester e devolva o arquivo Python completo já refatorado com as correções solicitadas.
-Instruções:
-- Analise o problema reportado pelo SonarQube
-- Corrija APENAS o problema específico mencionado
-- Reflita as correções em TODO o arquivo, mantendo a estrutura e funcionalidades existentes
-- Retorne SOMENTE o código Python final dentro de um bloco ```python``` (sem explicações, diffs ou comentários extras)
-- Preserve a indentação e o formato do arquivo
+You are the programmer. Consume the context prepared by the Requester and return the full Python file with the requested corrections applied.
+Instructions:
+- Analyse the SonarQube issue that was reported.
+- Fix ONLY the specific problem that is mentioned.
+- Apply the correction across the entire file while keeping behaviour and structure intact.
+- Return ONLY the final Python source inside a single ```python``` block (no explanations, diffs, or extra comments).
+- Preserve indentation and formatting.
 """
 
 
@@ -50,13 +50,13 @@ class FixerAgent:
             [
                 (
                     "human",
-                    "Você receberá um issue do SonarQube e deve responder com o arquivo Python completo corrigido.\n"
-                    "Regra: {issue_rule}\n"
-                    "Mensagem: {issue_message}\n"
-                    "Arquivo: {target_path}\n"
-                    "Contexto adicional:\n{requester_context}\n\n"
-                    "Código original:\n{original_code}\n\n"
-                    "Retorne apenas um bloco ```python``` contendo o arquivo completo com as correções aplicadas.",
+                    "You will receive a SonarQube issue and must reply with the fully corrected Python file.\n"
+                    "Rule: {issue_rule}\n"
+                    "Message: {issue_message}\n"
+                    "File: {target_path}\n"
+                    "Additional context:\n{requester_context}\n\n"
+                    "Original code:\n{original_code}\n\n"
+                    "Return only one ```python``` block containing the entire file with the applied fix.",
                 )
             ]
         )
