@@ -45,8 +45,13 @@ class SonarQubeClient:
     def _url(self, path: str) -> str:
         return f"{self.host_url.rstrip('/')}{path}" if path.startswith("/") else f"{self.host_url.rstrip('/')}/{path}"
 
-    def search_issues(self, severities: Iterable[str] | None = None, statuses: Iterable[str] | None = None) -> List[SonarIssue]:
-        """Fetch open issues for the configured project."""
+    def search_issues(
+        self,
+        severities: Iterable[str] | None = None,
+        statuses: Iterable[str] | None = None,
+        resolved: Optional[bool] = None,
+    ) -> List[SonarIssue]:
+        """Fetch project issues respecting severity, status and resolution filters."""
         params = {
             "componentKeys": self.project_key,
             "p": 1,
@@ -56,6 +61,8 @@ class SonarQubeClient:
             params["severities"] = ",".join(severities)
         if statuses:
             params["statuses"] = ",".join(statuses)
+        if resolved is not None:
+            params["resolved"] = "true" if resolved else "false"
         issues: List[SonarIssue] = []
         while True:
             LOGGER.debug("Fetching Sonar issues page %s", params["p"])

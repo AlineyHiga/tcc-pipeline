@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import List
 
 from app.a2a.protocol import Issue, State
-from app.sonarqube_client import SonarQubeClient
+from app.sonarqube_client import SonarQubeClient, format_issue
 from app.utils import run_sonar_scanner
 
 LOGGER = logging.getLogger(__name__)
@@ -35,7 +35,12 @@ def invoke(state: State) -> State:
         )
         return state
     client = SonarQubeClient()
-    issues = client.search_issues()
+    issues = client.search_issues(statuses=("OPEN", "REOPENED", "CONFIRMED"), resolved=False)
+    if issues:
+        formatted_issues = "\n\n".join(format_issue(issue) for issue in issues)
+        LOGGER.debug("Issues retornadas pelo Sonar:\n%s", formatted_issues)
+    else:
+        LOGGER.debug("Nenhuma issue retornada pelo Sonar.")
 
     target_components = {
         issue.component for issue in (state.get("issues_for_file") or []) if issue
@@ -46,6 +51,10 @@ def invoke(state: State) -> State:
     remaining: List[Issue] = []
     for item in issues:
         if item.component in target_components:
+            status = (item.status or "").upper()
+            if status in {"CLOSED", "RESOLVED"}:
+                LOGGER.debug("Ignorando issue resolvida %s com status %s", item.key, status)
+                continue
             remaining.append(
                 Issue(
                     key=item.key,

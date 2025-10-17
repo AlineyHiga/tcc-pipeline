@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.a2a.protocol import Issue, State
 from app.llm_client import LLMClient
@@ -79,16 +79,31 @@ class RequesterAgent:
         multi_issue_summary = "\n".join(summary_items)
 
         tester_feedback = state.get("tester_summary")
+        tester_focus = state.get("tester_feedback_summary")
         sonar_feedback = state.get("sonar_summary")
+        tester_generated = list(state.get("tester_generated_test_files") or [])
 
-        prompt = self._build_prompt(display_path, grouped, file_text, tester_feedback, sonar_feedback)
+        prompt = self._build_prompt(
+            display_path,
+            grouped,
+            file_text,
+            tester_feedback,
+            tester_focus,
+            tester_generated,
+            sonar_feedback,
+        )
         llm_summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
+
+        tester_cases = list(state.get("tester_feedback_cases") or [])
 
         context = self._build_context(
             display_path,
             grouped,
             file_text,
             llm_summary,
+            tester_focus,
+            tester_cases,
+            tester_generated,
         )
 
         processed.add(component)
@@ -212,18 +227,39 @@ class RequesterAgent:
             rows.append(f"{idx}. [{issue.key}] Linha {line} — {message} ({issue.rule})")
         return rows
 
+    def _format_feedback_case(self, case: Dict[str, Any]) -> str:
+        if not isinstance(case, dict):
+            return f"- {case}"
+        case_type = case.get("type")
+        message = str(case.get("message") or "").strip()
+        if case_type == "property":
+            prop = case.get("property") or "(propriedade)"
+            stage = case.get("stage") or "property_violation"
+            inputs = case.get("inputs") or {}
+            return f"- {prop} [{stage}]: inputs={inputs} -> {message or 'violação detectada'}"
+        if case_type == "pytest":
+            return f"- Pytest: {message or 'falha registrada pelo pytest'}"
+        return f"- {message or 'Falha reportada pelo tester'}"
+
     def _build_prompt(
         self,
         file_path: str,
         issues: List[Issue],
         file_text: str,
         tester_feedback: Optional[str],
+        tester_focus: Optional[str],
+        tester_generated: List[str],
         sonar_feedback: Optional[str],
     ) -> str:
         issue_lines = "\n".join(self._format_issue_list(issues))
         feedback_lines = []
         if tester_feedback:
             feedback_lines.append(f"Tester feedback: {tester_feedback.strip()}")
+        if tester_focus:
+            feedback_lines.append(f"Tester foco: {tester_focus.strip()}")
+        if tester_generated:
+            generated_text = ", ".join(tester_generated)
+            feedback_lines.append(f"Testes gerados: {generated_text}")
         if sonar_feedback:
             feedback_lines.append(f"Sonar feedback: {sonar_feedback.strip()}")
         feedback_block = "\n".join(feedback_lines) if feedback_lines else ""
@@ -245,6 +281,9 @@ class RequesterAgent:
         issues: List[Issue],
         file_text: str,
         llm_summary: str,
+        tester_focus: Optional[str],
+        tester_cases: List[Dict[str, Any]],
+        tester_generated: List[str],
     ) -> str:
         lines = [
             f"Arquivo alvo: {file_path}",
@@ -253,6 +292,14 @@ class RequesterAgent:
         lines.extend(self._format_issue_list(issues))
         if llm_summary.strip():
             lines.append("Requester summary:\n" + llm_summary.strip())
+        if tester_focus:
+            lines.append("Resumo do tester:\n" + tester_focus.strip())
+        if tester_cases:
+            formatted_cases = [self._format_feedback_case(case) for case in tester_cases[:3]]
+            if formatted_cases:
+                lines.append("Casos destacados pelo tester:\n" + "\n".join(formatted_cases))
+        if tester_generated:
+            lines.append("Arquivos de testes gerados:\n" + "\n".join(f"- {path}" for path in tester_generated))
         lines.append("Código completo:\n" + file_text)
         return "\n".join(lines)
 

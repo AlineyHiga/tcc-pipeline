@@ -113,20 +113,19 @@ class DeploymentAgent:
 
         system_message = SystemMessage(
             content=(
-                "Você é o Deployment Agent. Analise o contexto e crie um pull request usando o "
-                "tool `pull_requests_create`. Preencha título, corpo, head (branch atual) e base "
-                "com os dados fornecidos. Execute a ferramenta exatamente uma vez e, após receber "
-                "o resultado, responda com um breve resumo em português."
+                "You are the Deployment Agent. Analyse the context and open a pull request using "
+                "the `pull_requests_create` tool exactly once. Provide title, body, head (current branch) "
+                "and base using the supplied data. After the tool responds, return a short English summary."
             )
         )
         human_message = HumanMessage(
             content=(
-                f"Issue: {issue.key} ({issue.rule}, severidade {issue.severity}).\n"
-                f"Mensagem: {issue.message}.\n"
-                f"Branch head: {branch}. Branch base: {self.base_branch}.\n"
-                f"Feedback acumulado:\n{(state.get('feedback_log') or 'Sem feedback adicional.').strip()}\n\n"
-                f"Resumo do Fixer:\n{state.get('fixer_summary', '(Resumo indisponível)')}\n\n"
-                f"Logs do Tester:\n{test_logs}"
+                f"Issue: {issue.key} ({issue.rule}, severity {issue.severity}).\n"
+                f"Message: {issue.message}.\n"
+                f"Head branch: {branch}. Base branch: {self.base_branch}.\n"
+                f"Accumulated feedback:\n{(state.get('feedback_log') or 'No additional feedback.').strip()}\n\n"
+                f"Fixer summary:\n{state.get('fixer_summary', '(Summary unavailable)')}\n\n"
+                f"Tester logs:\n{test_logs}"
             )
         )
 
