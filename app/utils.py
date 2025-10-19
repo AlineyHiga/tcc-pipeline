@@ -197,3 +197,17 @@ def format_issues_for_prompt(issues: Iterable[Mapping[str, object]]) -> str:
         location = f"{component}:{line}" if line else str(component)
         lines.append(f"[{severity}] {rule} @ {location}\n{message}")
     return "\n\n".join(lines)
+
+
+def with_line_numbers(text: str, start: int = 1, delimiter: str = " | ") -> str:
+    """Annotate text with line numbers for prompting contexts."""
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if text.endswith("\n"):
+        lines.append("")
+    width = len(str(start + len(lines) - 1)) if lines else len(str(start))
+    numbered = []
+    for idx, line in enumerate(lines, start=start):
+        numbered.append(f"{str(idx).rjust(width)}{delimiter}{line}")
+    return "\n".join(numbered)

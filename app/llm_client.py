@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 LOGGER = logging.getLogger(__name__)
 
@@ -18,6 +18,16 @@ class LLMClient:
         self.temperature = float(temperature)
         self.provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
         self._client = None
+        self.max_completion_tokens = self._coerce_max_tokens(
+            "LLM_MAX_COMPLETION_TOKENS",
+            fallback=4096,
+            allow_zero=False,
+        )
+        self.local_max_tokens = self._coerce_max_tokens(
+            "LLM_LOCAL_MAX_TOKENS",
+            fallback=0,
+            allow_zero=True,
+        )
         if self.provider == "local":
             self._client = self._init_local_client()
         else:
@@ -66,6 +76,13 @@ class LLMClient:
         }
         if base_url:
             kwargs["base_url"] = base_url
+        if self.max_completion_tokens is not None:
+            kwargs["max_completion_tokens"] = self.max_completion_tokens
+            LOGGER.debug(
+                "LLM[%s] configurado com max_completion_tokens=%s",
+                self.role,
+                self.max_completion_tokens,
+            )
         return ChatOpenAI(**kwargs)
 
     def _invoke_openai(self, system_prompt: str, user_prompt: str) -> str:
@@ -114,11 +131,46 @@ class LLMClient:
             {"role": "system", "content": system_prompt.strip()},
             {"role": "user", "content": user_prompt},
         ]
-        response = self._client.create_chat_completion(
-            messages=messages,
-            temperature=self.temperature,
-        )
+        kwargs: Dict[str, Any] = {
+            "messages": messages,
+            "temperature": self.temperature,
+        }
+        if self.local_max_tokens is not None:
+            kwargs["max_tokens"] = self.local_max_tokens
+        response = self._client.create_chat_completion(**kwargs)
         choices = response.get("choices") or []
         if not choices:
             raise RuntimeError("Local LLM não retornou escolhas válidas")
         return choices[0]["message"]["content"].strip()
+
+    @staticmethod
+    def _coerce_max_tokens(
+        env_name: str,
+        fallback: int,
+        allow_zero: bool,
+    ) -> Optional[int]:
+        raw_value = os.getenv(env_name)
+        if raw_value is None or not raw_value.strip():
+            return fallback
+        try:
+            parsed = int(raw_value)
+        except ValueError:
+            LOGGER.warning(
+                "Valor inválido para %s=%r. Utilizando fallback %d.",
+                env_name,
+                raw_value,
+                fallback,
+            )
+            return fallback
+        if parsed < 0:
+            LOGGER.warning(
+                "Valor negativo para %s=%d. Utilizando fallback %d.",
+                env_name,
+                parsed,
+                fallback,
+            )
+            return fallback
+        if parsed == 0 and not allow_zero:
+            LOGGER.info("Valor zero informado em %s; não será aplicado limite explícito.", env_name)
+            return None
+        return parsed

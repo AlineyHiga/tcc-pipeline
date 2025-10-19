@@ -94,24 +94,39 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
     def feedback_node(state: State) -> State:
         state.setdefault("repo_root", repo_root.as_posix())
         execution_failed = state.get("execution_failed", False)
+        tests_failed = state.get("test_passed") is False
         loops = state.get("feedback_loops", 0)
         should_retry = False
 
+        failure_source: str | None = None
         if execution_failed:
+            failure_source = "executor"
+        elif tests_failed:
+            failure_source = "tester"
+
+        if failure_source:
             if loops < MAX_FEEDBACK_LOOPS:
                 loops += 1
                 state["feedback_loops"] = loops
-                test_output = (state.get("test_output") or "").strip()
+                test_output = (
+                    state.get("test_output")
+                    or state.get("tester_summary")
+                    or ""
+                ).strip()
                 if not test_output:
                     test_output = "Testes falharam, mas nenhuma saída foi capturada."
-                entry_header = f"Tentativa {loops} falhou"
+                entry_header = f"Tentativa {loops} falhou ({failure_source})"
                 new_entry = f"{entry_header}:\n{test_output}"
                 feedback_log = state.get("feedback_log") or ""
                 state["feedback_log"] = (
                     f"{feedback_log}\n\n{new_entry}" if feedback_log else new_entry
                 )
-                LOGGER.info("Feedback loop #%d acionado após falha nos testes", loops)
-                state["tester_summary"] = test_output
+                LOGGER.info(
+                    "Feedback loop #%d acionado após falha (%s)",
+                    loops,
+                    failure_source,
+                )
+                state["tester_summary"] = state.get("tester_summary") or test_output
                 processed = set(state.get("processed_components") or [])
                 current_issue = state.get("issue")
                 if current_issue and getattr(current_issue, "component", None) in processed:
@@ -138,6 +153,7 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
             if loops:
                 LOGGER.debug("Feedback loop resetado após sucesso dos testes (antes=%d)", loops)
             state["feedback_loops"] = 0
+            state["execution_failed"] = False
             state["retry_requested"] = False
             return state
 
@@ -186,7 +202,20 @@ def build_graph(repo_root: Path | None = None) -> StateGraph:
     builder.add_edge("fixer", "executor")
     builder.add_edge("executor", "feedback")
     builder.add_conditional_edges("feedback", feedback_router)
-    builder.add_edge("tester", "sonar")
+
+    def tester_router(state: State) -> Literal["feedback", "sonar"]:
+        if state.get("test_passed"):
+            return "sonar"
+        loops = state.get("feedback_loops", 0)
+        if loops >= MAX_FEEDBACK_LOOPS:
+            LOGGER.info(
+                "Tester falhou após atingir limite de feedback loops; seguindo para sonar."
+            )
+            state["retry_requested"] = False
+            return "sonar"
+        return "feedback"
+
+    builder.add_conditional_edges("tester", tester_router)
     builder.add_edge("sonar", "deployment")
     builder.add_edge("deployment", END)
 

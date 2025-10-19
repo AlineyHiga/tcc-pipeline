@@ -10,14 +10,20 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 from langchain_core.prompts import ChatPromptTemplate
 
 from app.a2a.protocol import State
 from app.llm_client import LLMClient
+from app.utils import with_line_numbers
 
 LOGGER = logging.getLogger(__name__)
+
+REMOVAL_KEYWORD_PATTERN = re.compile(
+    r"\b(remove|remover|remova|delete|deletar|eliminate|eliminar|drop|excluir|exclua)\b",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """
 You are the programmer. Consume the context prepared by the Requester and return the full Python file with the requested corrections applied.
@@ -25,8 +31,10 @@ Instructions:
 - Analyse the SonarQube issue that was reported.
 - Fix ONLY the specific problem that is mentioned.
 - Apply the correction across the entire file while keeping behaviour and structure intact.
-- Return ONLY the final Python source inside a single ```python``` block (no explanations, diffs, or extra comments).
+- Return ONLY the final Python source inside a single ```python``` block (no explanations, diffs, ou texto adicional). O bloco deve conter o arquivo completo, linha por linha, incluindo partes que não foram alteradas; nunca use reticências, placeholders ou comentários como “restante inalterado”.
 - Preserve indentation and formatting.
+- Preserve every existing top-level function and class along with their original names; do not remove, rename, or add new top-level elements unless the issue explicitly requires it.
+- Ignore any line numbers in the provided source and return code without them.
 """
 
 
@@ -55,8 +63,11 @@ class FixerAgent:
                     "Message: {issue_message}\n"
                     "File: {target_path}\n"
                     "Additional context:\n{requester_context}\n\n"
-                    "Original code:\n{original_code}\n\n"
-                    "Return only one ```python``` block containing the entire file with the applied fix.",
+                    "Original code (line numbers included for reference):\n{original_code}\n\n"
+                    "Return only one ```python``` block containing the entire file with the applied fix. "
+                    "Do not include line numbers in your response. "
+                    "The block must include the entire file content, without ellipses or omitted sections. "
+                    "All original top-level functions or classes must remain present with the same names unless the issue explicitly demands a change.",
                 )
             ]
         )
@@ -87,6 +98,7 @@ class FixerAgent:
         LOGGER.debug("Fixer resolved target file to %s (diff path %s)", resolved_path, diff_path)
         original_content = resolved_path.read_text()
         LOGGER.debug("Original file size: %d chars", len(original_content))
+        original_with_numbers = with_line_numbers(original_content)
 
         issues_block = self._render_issue_list(issues_for_file or ([issue] if issue else []))
         issue_rules = [
@@ -101,7 +113,7 @@ class FixerAgent:
             "issue_message": issues_block,
             "target_path": diff_path,
             "requester_context": context or "(Contexto indisponível)",
-            "original_code": original_content,
+            "original_code": original_with_numbers,
         }
         prompt_value = self.prompt.format_prompt(**prompt_input)
         user_prompt = prompt_value.to_messages()[0].content
@@ -127,6 +139,17 @@ class FixerAgent:
             )
             LOGGER.debug("Sanitized diff-like response size: %d chars", len(fixed_content))
 
+        if self._has_placeholder_markers(fixed_content):
+            LOGGER.error("Fixer output for %s contém placeholders indicando omissões.", diff_path)
+            state["patch"] = ""
+            state.update({
+                "fixer_summary": (
+                    "Fixer retornou código com trechos omitidos (ex: 'rest of the functions remain unchanged')."
+                ),
+                "fix_failed": True,
+            })
+            return state
+
         is_valid_python, syntax_error = self._is_valid_python_code(fixed_content)
         if not is_valid_python:
             LOGGER.error(
@@ -144,6 +167,37 @@ class FixerAgent:
                 "fix_failed": True,
             })
             return state
+
+        original_defs = self._collect_top_level_defs(original_content)
+        fixed_defs = self._collect_top_level_defs(fixed_content)
+        missing_defs = sorted(original_defs - fixed_defs)
+        blocked_defs = self._blocked_definition_removals(
+            missing_defs,
+            issues_for_file or ([issue] if issue else []),
+            context or "",
+        )
+        if blocked_defs:
+            LOGGER.error(
+                "Fixer output for %s is missing top-level definitions: %s",
+                diff_path,
+                ", ".join(blocked_defs),
+            )
+            state["patch"] = ""
+            state.update(
+                {
+                    "fixer_summary": (
+                        "Fixer removeu definições obrigatórias: "
+                        f"{', '.join(blocked_defs)}"
+                    ),
+                    "fix_failed": True,
+                }
+            )
+            return state
+        if missing_defs and not blocked_defs:
+            LOGGER.info(
+                "Fixer autorizou remoção de definições %s devido a instruções explícitas nas issues/contexto.",
+                ", ".join(missing_defs),
+            )
 
         candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
         LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
@@ -288,6 +342,23 @@ class FixerAgent:
         LOGGER.debug("Diff-like response detected=%s", match)
         return match
 
+    def _has_placeholder_markers(self, content: str) -> bool:
+        """Detect placeholder phrases that indicate the file was truncated."""
+        if not content:
+            return False
+        lowered = content.lower()
+        patterns = [
+            "rest of the functions remain unchanged",
+            "rest of the file remains unchanged",
+            "rest of the code remains unchanged",
+            "omitted for brevity",
+            "remaining code unchanged",
+        ]
+        for marker in patterns:
+            if marker in lowered:
+                return True
+        return False
+
     def _sanitize_diff_like_response(self, response: str, file_path: str, original: str) -> str:
         """
         Corrige respostas onde o LLM retornou um pseudo-diff em vez de código puro.
@@ -329,6 +400,64 @@ class FixerAgent:
             LOGGER.warning("Sanitize produced no new code; fallback to original content.")
             return original
         return cleaned
+
+    def _blocked_definition_removals(
+        self,
+        missing_defs: List[str],
+        issues: List,
+        context: str,
+    ) -> List[str]:
+        """Return the subset of missing definitions that cannot be removed."""
+        if not missing_defs:
+            return []
+
+        text_sources: List[str] = []
+        for item in issues:
+            message = getattr(item, "message", "")
+            if message:
+                text_sources.append(message)
+            rule = getattr(item, "rule", "")
+            if rule:
+                text_sources.append(rule)
+        if context:
+            text_sources.append(context)
+
+        blocked: List[str] = []
+        for name in missing_defs:
+            if not self._removal_requested_for(name, text_sources):
+                blocked.append(name)
+        return blocked
+
+    def _removal_requested_for(self, definition_name: str, sources: Iterable[str]) -> bool:
+        """Return True when any source explicitly requests removing `definition_name`."""
+        if not definition_name:
+            return False
+        normalized_targets = {definition_name.lower()}
+        if "_" in definition_name:
+            normalized_targets.add(definition_name.replace("_", " ").lower())
+            normalized_targets.add(definition_name.replace("_", "").lower())
+
+        for raw in sources:
+            text = (raw or "").lower()
+            if not text:
+                continue
+            if not REMOVAL_KEYWORD_PATTERN.search(text):
+                continue
+            if any(target in text for target in normalized_targets):
+                return True
+        return False
+
+    def _collect_top_level_defs(self, source: str) -> set[str]:
+        """Collect names of top-level functions and classes."""
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return set()
+        names: set[str] = set()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.add(node.name)
+        return names
 
     def _is_valid_python_code(self, code: str) -> tuple[bool, str | None]:
         """Return whether code is valid Python and, if not, the syntax error."""

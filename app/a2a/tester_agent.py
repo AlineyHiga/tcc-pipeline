@@ -5,6 +5,7 @@ import ast
 import contextlib
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import os
@@ -35,18 +36,6 @@ Do not propose code changes or refactorings to the patched file.
 If every test passes, confirm that validation succeeded.
 """
 
-PROPERTY_SYSTEM_PROMPT = """
-You convert abstract properties into executable checkers.
-For each property, produce a Python snippet with a single function that receives
-`inputs: dict` and `output: Any` and returns True when the property holds, otherwise False.
-Respond strictly in JSON with the fields:
-- name: short snake_case identifier for the property.
-- description: one-sentence summary of what the checker enforces.
-- function_name: name of the function defined in the code.
-- code: Python code (standard library only) defining the requested function.
-Do not include text outside the JSON payload.
-"""
-
 PROPERTY_DISCOVERY_PROMPT = """
 You analyse a Python file together with the related SonarQube issues and propose properties
 that verify the recently applied fix.
@@ -58,16 +47,40 @@ Each list item must contain:
   otherwise use "path/to/file.py::function" to reference the file explicitly.
 - inputs: list of parameter names that should be supplied when calling the function.
 - context (optional): extra hints that help understand the property.
+As propriedades devem considerar que os testes serão escritos com o framework `Hypothesis`.
 Limit yourself to properties related to the reported issues and do not output text outside JSON."""
 
-PBT_INPUT_PROMPT = """
-You synthesise additional input data to test properties.
-You will receive the context of a validated property and must answer in JSON with the field `inputs`,
-containing a list of dictionaries that represent extra calls exploring diverse scenarios.
-Keep values as Python literals (int, float, bool, str, simple lists and dicts).
-Do not include text outside JSON.
-"""
+PROPERTY_SUITE_PROMPT = """
+You design Hypothesis property-based tests to validate a Sonar-guided bug fix.
+Always produce BOTH of the following suites:
+- Backward compatibility: outside the bug domain the new behaviour must match the old behaviour.
+- Metamorphic invariants: semantic properties that must remain true forever (e.g. idempotence, monotonicity, permutations).
 
+You receive structured context about the change. Use it to derive a precise predicate bug_domain(inputs_dict) -> bool that
+identifies the inputs where the fix intentionally changes behaviour. Everything outside bug_domain must remain backward compatible.
+
+Guardrails:
+- Tests must rely only on the Python standard library, pytest, and Hypothesis.
+- Do NOT perform I/O, networking, sleeping, or unrestricted randomness.
+- Cap data generation ranges (finite integers/floats, bounded text length, capped collection sizes).
+- Use assume() for preconditions.
+- Do not mutate Hypothesis inputs in-place.
+- Use the helper callables `old_impl` and `new_impl` provided by the harness to execute the old and new implementations.
+- Use the helper bug_domain function you define to guard the compatibility assertions.
+
+Respond strictly in JSON with the fields:
+- bug_domain: object with fields { "name": snake_case identifier, "description": short text, "code": Python source defining bug_domain(inputs_dict) -> bool }.
+- compatibility_tests: non-empty list of objects { "name": snake_case test id, "description": short text, "code": full Python function including decorators }.
+- metamorphic_tests: non-empty list of objects with the same schema as compatibility_tests.
+- imports (optional): list of extra import statements required by the tests (e.g. "from collections import Counter").
+- notes (optional): additional guidance for humans (will be stored as comments).
+
+Formatting rules:
+- Wrap every value under a "code" key (including bug_domain["code"]) inside a fenced block that starts with ```python and ends with ```.
+- Inside each fenced block include only executable Python code; do not add explanations or comments.
+- Do not emit any commentary outside the JSON payload.
+
+Return the JSON object only, without extra text before or after it."""
 
 class TesterAgent:
     def __init__(self, temperature: float = 0.0, repo_root: Optional[Union[Path, str]] = None) -> None:
@@ -189,8 +202,12 @@ class TesterAgent:
         results: List[PropertyExample] = []
         for item in items:
             target = item.get("property_name")
-            if target and target != property_name:
-                continue
+            if target:
+                normalized = str(target).strip()
+                if normalized and normalized != property_name:
+                    base_identifier = property_name.split("::", 1)[0]
+                    if normalized != base_identifier:
+                        continue
             if "inputs" not in item or "output" not in item:
                 continue
             results.append(item)
@@ -346,29 +363,9 @@ class TesterAgent:
         neg_examples: List[PropertyExample],
         property_name: str,
     ) -> PropertyCheck:
-        prompt = self._render_property_prompt(prop, pos_examples, neg_examples)
-        raw_response = self.llm.invoke(PROPERTY_SYSTEM_PROMPT, prompt)
-        payload = self._parse_json_response(raw_response, f"verificador da propriedade {prop.get('name') or prop.get('function')}")
-
-        name = payload.get("name") or prop.get("name") or "property_check"
-        code = payload.get("code")
-        function_name = payload.get("function_name")
-        description = payload.get("description") or prop.get("description") or ""
-        if not code:
-            raise ValueError("Resposta não contém o campo 'code'")
-        if not function_name:
-            raise ValueError("Resposta não contém o campo 'function_name'")
-        check = PropertyCheck(
-            name=name,
-            description=description,
-            function_name=function_name,
-            code=code,
+        raise RuntimeError(
+            "Geração automática de verificadores via LLM está desativada; forneça verificadores previamente calculados."
         )
-        check["property_name"] = property_name
-        target = (prop.get("function") or prop.get("target") or "").strip()
-        if target:
-            check["property_target"] = target  # type: ignore[assignment]
-        return check
 
     def _compile_property_check(self, check: PropertyCheck) -> Callable[[Dict[str, Any], Any], bool]:
         namespace: Dict[str, Any] = {
@@ -439,42 +436,350 @@ class TesterAgent:
         check: PropertyCheck,
         property_name: str,
     ) -> Tuple[List[PropertyInput], Optional[str]]:
-        prompt_lines = [
-            f"Propriedade: {prop.get('name') or check.get('name')}",
-            f"Descrição: {prop.get('description') or check.get('description')}",
-            f"Função alvo: {prop.get('function') or prop.get('target')}",
-            f"Parâmetros: {', '.join(prop.get('inputs') or []) or '(não informado)'}",
-            "Código do verificador validado:",
-            check.get("code", ""),
-        ]
-        prompt = "\n".join(prompt_lines)
-        raw_response = self.llm.invoke(PBT_INPUT_PROMPT, prompt)
-        data = self._parse_json_response(raw_response, f"entradas PBT da propriedade {prop.get('name')}")
-        payload_inputs: List[Dict[str, Any]] = []
-        generator_script: Optional[str] = None
-        if isinstance(data, dict):
-            payload_inputs = data.get("inputs") or []
-            generator_script = data.get("generator")
-        elif isinstance(data, list):
-            payload_inputs = data
-        else:
-            LOGGER.warning(
-                "Resposta inesperada ao gerar inputs para propriedade %s: %r",
-                prop.get("name"),
-                data,
-            )
-            payload_inputs = []
-        collected: List[PropertyInput] = []
-        for item in payload_inputs:
-            if not isinstance(item, dict):
+        # Hypothesis already provides data generation capabilities. We no longer
+        # solicit extra inputs from the LLM and instead rely on existing
+        # examples gathered from the state.
+        return [], None
+
+    def _split_target_reference(self, target_ref: str) -> Tuple[str, List[str]]:
+        if not target_ref:
+            return "", []
+        if "::" in target_ref:
+            _, _, attr_path = target_ref.partition("::")
+            chain = [segment.strip() for segment in attr_path.split(".") if segment.strip()]
+            return "", chain
+        parts = [segment for segment in target_ref.split(".") if segment]
+        if not parts:
+            return "", []
+        for split in range(len(parts), 0, -1):
+            module_candidate = ".".join(parts[:split])
+            try:
+                with self._syspath_context():
+                    importlib.import_module(module_candidate)
+            except Exception:  # noqa: BLE001 - tolerate modules with side effects
                 continue
-            collected.append(
-                PropertyInput(
-                    property_name=property_name,
-                    inputs=item,
-                )
-            )
-        return collected, generator_script
+            attr_chain = [segment for segment in parts[split:] if segment]
+            return module_candidate, attr_chain
+        return "", parts
+
+    def _extract_patch_for_file(self, patch_text: str, file_path: str) -> Optional[str]:
+        if not patch_text or not file_path:
+            return None
+        normalized = Path(file_path).as_posix()
+        candidates = {normalized, normalized.lstrip("./")}
+        lines = patch_text.splitlines()
+        block: List[str] = []
+        capture = False
+        for line in lines:
+            if line.startswith("diff --git"):
+                if capture:
+                    break
+                match = re.match(r"diff --git a/(.+) b/(.+)", line)
+                if not match:
+                    capture = False
+                    continue
+                old_path, new_path = match.groups()
+                if any(new_path.endswith(suffix) for suffix in candidates) or any(
+                    old_path.endswith(suffix) for suffix in candidates
+                ):
+                    capture = True
+                    block.append(line)
+                else:
+                    capture = False
+                continue
+            if capture and line.startswith("diff --git"):
+                break
+            if capture:
+                block.append(line)
+        return "\n".join(block).strip() or None
+
+    def _reconstruct_original_code(self, file_path: str, new_code: str, patch_text: str) -> Optional[str]:
+        if not patch_text or not new_code:
+            return None
+        patch_block = self._extract_patch_for_file(patch_text, file_path)
+        if not patch_block:
+            return None
+        new_lines = new_code.splitlines(keepends=True)
+        old_lines: List[str] = []
+        block_lines = patch_block.splitlines()
+        hunk_pattern = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+        hunks: List[Tuple[int, List[str]]] = []
+        current_hunk: Optional[Tuple[int, List[str]]] = None
+        for line in block_lines:
+            match = hunk_pattern.match(line)
+            if match:
+                new_start = int(match.group(3))
+                current_hunk = (new_start, [])
+                hunks.append(current_hunk)
+                continue
+            if current_hunk is None:
+                continue
+            if line.startswith("\\ No newline at end of file"):
+                continue
+            current_hunk[1].append(line)
+
+        if not hunks:
+            return None
+
+        new_index = 0  # zero-based index into new_lines
+        current_line = 1  # one-based logical position within new_lines
+        for new_start, hunk_lines in hunks:
+            target_line = max(new_start, 1)
+            while current_line < target_line and new_index < len(new_lines):
+                old_lines.append(new_lines[new_index])
+                new_index += 1
+                current_line += 1
+            for entry in hunk_lines:
+                if not entry:
+                    continue
+                prefix, content = entry[0], entry[1:]
+                if prefix == " ":
+                    if new_index < len(new_lines):
+                        old_lines.append(new_lines[new_index])
+                        new_index += 1
+                        current_line += 1
+                    else:
+                        old_lines.append(content + "\n")
+                elif prefix == "+":
+                    if new_index < len(new_lines):
+                        new_index += 1
+                        current_line += 1
+                elif prefix == "-":
+                    old_lines.append(content + "\n")
+        while new_index < len(new_lines):
+            old_lines.append(new_lines[new_index])
+            new_index += 1
+        return "".join(old_lines)
+
+    def _extract_symbol_source(self, code: str, attr_chain: List[str]) -> Tuple[Optional[str], Optional[str]]:
+        if not code or not attr_chain:
+            return None, None
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None, None
+
+        def _find(node: ast.AST, chain: List[str]) -> Optional[ast.AST]:
+            if not chain:
+                return node
+            target_name = chain[0]
+            body = getattr(node, "body", [])
+            for child in body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name == target_name:
+                    return _find(child, chain[1:])
+            return None
+
+        target_node = _find(tree, attr_chain)
+        if target_node is None:
+            return None, None
+        lines = code.splitlines()
+        start = getattr(target_node, "lineno", None)
+        end = getattr(target_node, "end_lineno", None)
+        snippet: Optional[str] = None
+        if isinstance(start, int) and isinstance(end, int) and 1 <= start <= len(lines):
+            snippet = "\n".join(lines[start - 1 : end]).rstrip()
+        doc = None
+        try:
+            doc = ast.get_docstring(target_node)
+        except TypeError:
+            doc = None
+        return snippet, doc
+
+    def _get_signature_string(self, func: Callable[..., Any]) -> Optional[str]:
+        if not callable(func):
+            return None
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return None
+        qualname = getattr(func, "__qualname__", getattr(func, "__name__", "callable"))
+        return f"{qualname}{signature}"
+
+    def _collect_examples_payload(
+        self,
+        positive: Iterable[PropertyExample],
+        negative: Iterable[PropertyExample],
+        limit: int = 5,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        def _normalize(items: Iterable[PropertyExample]) -> List[Dict[str, Any]]:
+            results: List[Dict[str, Any]] = []
+            for index, item in enumerate(items):
+                if index >= limit:
+                    break
+                inputs = item.get("inputs")
+                output = item.get("output")
+                if isinstance(inputs, dict):
+                    results.append(
+                        {
+                            "inputs": inputs,
+                            "output": output,
+                        }
+                    )
+            return results
+
+        return {
+            "positive_examples": _normalize(positive),
+            "negative_examples": _normalize(negative),
+        }
+
+    def _collect_property_strategy_context(
+        self,
+        state: State,
+        prop: AbstractProperty,
+        property_name: str,
+        new_file_content: str,
+        issues_summary: str,
+        positive_examples: Iterable[PropertyExample],
+        negative_examples: Iterable[PropertyExample],
+    ) -> Dict[str, Any]:
+        target_ref = (prop.get("function") or prop.get("target") or "").strip()
+        file_path = state.get("file_path", "")
+        module_path, attr_chain = self._split_target_reference(target_ref)
+        patch_text = state.get("patch") or ""
+        original_content = self._reconstruct_original_code(file_path, new_file_content, patch_text) or ""
+        old_snippet, old_doc = self._extract_symbol_source(original_content, attr_chain)
+        new_snippet, new_doc = self._extract_symbol_source(new_file_content, attr_chain)
+        signature = None
+        try:
+            resolved_callable = self._resolve_target_callable(prop, property_name)
+            signature = self._get_signature_string(resolved_callable)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Não foi possível coletar assinatura para %s: %s", property_name, exc)
+            resolved_callable = None
+        docstring = new_doc or old_doc
+        examples_payload = self._collect_examples_payload(positive_examples, negative_examples)
+        return {
+            "target_ref": target_ref,
+            "file_path": file_path,
+            "module_path": module_path,
+            "attr_chain": attr_chain,
+            "signature": signature,
+            "docstring": docstring,
+            "issues_summary": issues_summary,
+            "diff_patch": self._extract_patch_for_file(patch_text, file_path),
+            "old_snippet": old_snippet,
+            "new_snippet": new_snippet,
+            "original_content": original_content,
+            "examples": examples_payload,
+        }
+
+    def _render_old_callable_loader(self, attr_chain: List[str], old_snippet: Optional[str]) -> Tuple[str, str]:
+        if not attr_chain or not old_snippet:
+            return "", ""
+        attr_repr = repr(attr_chain)
+        snippet = textwrap.dedent(old_snippet).strip()
+        snippet = snippet.replace('"""', r'\"\"\"')
+        loader = textwrap.dedent(
+            f"""
+            import inspect
+            import textwrap
+
+            _OLD_ATTR_CHAIN = {attr_repr}
+            _OLD_SOURCE = textwrap.dedent(\"\"\"{snippet}\"\"\")
+
+            def _load_old_callable():
+                namespace: Dict[str, Any] = {{}}
+                exec(_OLD_SOURCE, namespace)
+                obj: Any = namespace
+                parent: Any = None
+                for attr in _OLD_ATTR_CHAIN:
+                    parent = obj
+                    obj = getattr(obj, attr)
+                if inspect.isfunction(obj) and parent is not None and inspect.isclass(parent):
+                    try:
+                        instance = parent()
+                        obj = getattr(instance, _OLD_ATTR_CHAIN[-1])
+                    except Exception:  # noqa: BLE001
+                        pass
+                if not callable(obj):
+                    raise TypeError(f"Função antiga não é chamável: {{_OLD_ATTR_CHAIN}}")
+                return obj
+
+            _OLD_CALLABLE = _load_old_callable()
+            """
+        ).strip()
+        return loader, "_OLD_CALLABLE"
+
+    def _build_strategy_prompt(self, context: Dict[str, Any]) -> str:
+        lines = [
+            f"Target callable: {context.get('target_ref') or '(desconhecido)'}",
+            f"Module path: {context.get('module_path') or '(sem módulo importável)'}",
+            f"Attribute chain: {'.'.join(context.get('attr_chain') or []) or '(vazio)'}",
+            f"Signature: {context.get('signature') or '(indisponível)'}",
+            f"Docstring: {context.get('docstring') or '(não fornecida)'}",
+            "",
+            "Sonar issues summary:",
+            context.get("issues_summary") or "(nenhuma issue disponível)",
+        ]
+        diff_block = context.get("diff_patch")
+        if diff_block:
+            lines.extend(["", "Unified diff for target file:", diff_block])
+        old_snippet = context.get("old_snippet")
+        if old_snippet:
+            lines.extend(["", "Original implementation snippet:", old_snippet])
+        new_snippet = context.get("new_snippet")
+        if new_snippet:
+            lines.extend(["", "Current implementation snippet:", new_snippet])
+        examples = context.get("examples") or {}
+        positive_examples = examples.get("positive_examples") or []
+        negative_examples = examples.get("negative_examples") or []
+        if positive_examples or negative_examples:
+            lines.append("")
+            lines.append("Known examples (as JSON):")
+            payload = {
+                "positive_examples": positive_examples,
+                "negative_examples": negative_examples,
+            }
+            lines.append(json.dumps(payload, ensure_ascii=False, indent=2))
+        lines.append("")
+        lines.append(
+            "Remember: the harness exposes helper callables `old_impl(**inputs)` and `new_impl(**inputs)` "
+            "for executing the old and new implementations respectively."
+        )
+        return "\n".join(lines).strip()
+
+    def _generate_property_tests(
+        self,
+        prop: AbstractProperty,
+        property_name: str,
+        slug: str,
+        context: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        prompt = self._build_strategy_prompt(context)
+        try:
+            raw_response = self.llm.invoke(PROPERTY_SUITE_PROMPT, prompt)
+            payload = self._parse_json_response(raw_response, f"suite de propriedades {property_name}")
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error("[%s] Falha ao gerar suite PBT: %s", property_name, exc)
+            return None
+
+        if not isinstance(payload, dict):
+            LOGGER.error("[%s] Resposta inválida ao gerar suite PBT: %s", property_name, payload)
+            return None
+
+        compatibility = payload.get("compatibility_tests") or []
+        metamorphic = payload.get("metamorphic_tests") or []
+        bug_domain = payload.get("bug_domain")
+
+        if not isinstance(compatibility, list) or not compatibility:
+            LOGGER.warning("[%s] Suite de compatibilidade vazia.", property_name)
+            return None
+        if not isinstance(metamorphic, list) or not metamorphic:
+            LOGGER.warning("[%s] Suite metamórfica vazia.", property_name)
+            return None
+        if not isinstance(bug_domain, dict):
+            LOGGER.warning("[%s] bug_domain ausente ou inválido.", property_name)
+            return None
+
+        return {
+            "bug_domain": bug_domain,
+            "compatibility": compatibility,
+            "metamorphic": metamorphic,
+            "imports": payload.get("imports") or [],
+            "notes": payload.get("notes") or "",
+        }
+
+
 
     def _resolve_target_callable(self, prop: AbstractProperty, property_name: str) -> Callable[..., Any]:
         target_ref = (prop.get("function") or prop.get("target") or "").strip()
@@ -643,7 +948,76 @@ class TesterAgent:
         module_path, _, attr = target_ref.rpartition(".")
         if not module_path or not attr:
             raise ValueError(f"[{property_name}] Caminho inválido para função alvo: {target_ref}")
-        loader = f"from {module_path} import {attr} as _target_callable"
+        parts = target_ref.split(".")
+        if len(parts) < 2:
+            raise ValueError(f"[{property_name}] Caminho inválido para função alvo: {target_ref}")
+        loader = textwrap.dedent(
+            f"""
+            import importlib
+            import importlib.util
+            import inspect
+            import sys
+            from pathlib import Path
+
+            _ROOT = Path(__file__).resolve().parents[2]
+            _SRC = _ROOT / "src"
+            for _path in (_ROOT, _SRC):
+                _path_str = str(_path)
+                if _path_str not in sys.path:
+                    sys.path.insert(0, _path_str)
+
+            _target_callable = None
+            _parts = {parts!r}
+
+            for _split in range(len(_parts) - 1, 0, -1):
+                _module_name = ".".join(_parts[:_split])
+                _attr_chain = _parts[_split:]
+                try:
+                    _module = importlib.import_module(_module_name)
+                except ModuleNotFoundError:
+                    _module_path = Path(_ROOT, *_module_name.split("."))
+                    _file_candidate = _module_path.with_suffix(".py")
+                    _init_candidate = _module_path / "__init__.py"
+                    if _file_candidate.exists():
+                        _spec = importlib.util.spec_from_file_location(
+                            "_a2a_module_{slug}", _file_candidate
+                        )
+                    elif _init_candidate.exists():
+                        _spec = importlib.util.spec_from_file_location(
+                            "_a2a_module_{slug}", _init_candidate
+                        )
+                    else:
+                        continue
+                    if _spec is None or _spec.loader is None:
+                        continue
+                    _module = importlib.util.module_from_spec(_spec)
+                    _spec.loader.exec_module(_module)
+                _obj = _module
+                try:
+                    _parent = None
+                    for index, _attr in enumerate(_attr_chain):
+                        _parent = _obj
+                        _obj = getattr(_obj, _attr)
+                        if (
+                            inspect.isfunction(_obj)
+                            and inspect.isclass(_parent)
+                            and index == len(_attr_chain) - 1
+                        ):
+                            try:
+                                _instance = _parent()
+                                _obj = getattr(_instance, _attr)
+                            except Exception:  # noqa: BLE001
+                                pass
+                    if callable(_obj):
+                        _target_callable = _obj
+                        break
+                except AttributeError:
+                    continue
+
+            if _target_callable is None:
+                raise ImportError({f"Não foi possível resolver a função alvo {target_ref!r}"!r})
+            """
+        ).strip()
         return loader, "_target_callable"
 
     def _write_property_test_module(
@@ -652,16 +1026,153 @@ class TesterAgent:
         property_name: str,
         check: PropertyCheck,
         inputs: List[Dict[str, Any]],
+        state: State,
+        issues_summary: str,
+        new_file_content: str,
+        pos_examples: List[PropertyExample],
+        neg_examples: List[PropertyExample],
     ) -> Optional[Path]:
-        if not inputs:
-            return None
         slug = self._slugify(property_name)
         self.generated_test_root.mkdir(parents=True, exist_ok=True)
         test_path = self.generated_test_root / f"test_property_{slug}.py"
         loader_code, target_expr = self._render_target_loader(prop, property_name, slug)
-        check_code = textwrap.dedent(check.get("code") or "").strip()
 
-        lines: List[str] = ["# Auto-generated by TesterAgent. Do not edit.", "import pytest"]
+        strategy_context = self._collect_property_strategy_context(
+            state,
+            prop,
+            property_name,
+            new_file_content,
+            issues_summary,
+            pos_examples,
+            neg_examples,
+        )
+
+        suite_payload: Optional[Dict[str, Any]] = None
+        old_loader: str = ""
+        old_expr: str = ""
+        if strategy_context.get("attr_chain") and strategy_context.get("old_snippet"):
+            old_loader, old_expr = self._render_old_callable_loader(
+                strategy_context.get("attr_chain") or [],
+                strategy_context.get("old_snippet"),
+            )
+            suite_payload = self._generate_property_tests(prop, property_name, slug, strategy_context)
+        else:
+            LOGGER.debug(
+                "[%s] Contexto insuficiente para gerar testes compatíveis via estratégia avançada.",
+                property_name,
+            )
+
+        if not suite_payload:
+            return self._write_fallback_property_test_module(
+                test_path,
+                slug,
+                loader_code,
+                target_expr,
+                check,
+                inputs,
+                prop,
+            )
+
+        bug_domain = suite_payload.get("bug_domain") or {}
+        bug_code = textwrap.dedent(bug_domain.get("code") or "").strip()
+        if not bug_code:
+            LOGGER.warning("[%s] Código do bug_domain ausente; revertendo para fallback.", property_name)
+            return self._write_fallback_property_test_module(
+                test_path,
+                slug,
+                loader_code,
+                target_expr,
+                check,
+                inputs,
+                prop,
+            )
+
+        lines: List[str] = [
+            "# Auto-generated by TesterAgent. Do not edit.",
+            "import pytest",
+            "from hypothesis import assume, given, strategies as st",
+            "from typing import Any, Dict",
+        ]
+        extra_imports: Iterable[str] = suite_payload.get("imports") or []
+        for item in extra_imports:
+            cleaned = str(item or "").strip()
+            if cleaned and cleaned not in lines:
+                lines.append(cleaned)
+        if loader_code:
+            lines.extend(loader_code.splitlines())
+        if old_loader:
+            lines.extend(old_loader.splitlines())
+        if lines and lines[-1]:
+            lines.append("")
+        lines.append(f"_NEW_CALLABLE = {target_expr}")
+        lines.append("def new_impl(**inputs: Any) -> Any:")
+        lines.append("    return _NEW_CALLABLE(**inputs)")
+        lines.append("")
+        if old_expr:
+            lines.append(f"_OLD_CALLABLE = {old_expr}")
+            lines.append("def old_impl(**inputs: Any) -> Any:")
+            lines.append("    return _OLD_CALLABLE(**inputs)")
+        else:
+            lines.append("def old_impl(**inputs: Any) -> Any:  # fallback when old code is unavailable")
+            lines.append("    raise RuntimeError('Old implementation unavailable')")
+        lines.append("")
+        description = bug_domain.get("description") or ""
+        if description:
+            lines.append(f"# bug_domain: {description}")
+        lines.extend(bug_code.splitlines())
+        lines.append("")
+        notes = suite_payload.get("notes")
+        if notes:
+            for line in str(notes).splitlines():
+                lines.append(f"# NOTE: {line}")
+            lines.append("")
+
+        def _append_suite(label: str, tests: Iterable[Dict[str, Any]]) -> None:
+            header = f"# {label}"
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(header)
+            for item in tests:
+                test_desc = item.get("description")
+                test_code = textwrap.dedent(item.get("code") or "").strip()
+                if not test_code:
+                    continue
+                if test_desc:
+                    lines.append(f"# {test_desc}")
+                lines.extend(test_code.splitlines())
+                if lines and lines[-1].strip():
+                    lines.append("")
+
+        _append_suite("Backward compatibility tests", suite_payload.get("compatibility") or [])
+        _append_suite("Metamorphic tests", suite_payload.get("metamorphic") or [])
+
+        while lines and not lines[-1].strip():
+            lines.pop()
+
+        test_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if test_path not in self._active_test_files:
+            self._active_test_files.append(test_path)
+        return test_path
+
+    def _write_fallback_property_test_module(
+        self,
+        test_path: Path,
+        slug: str,
+        loader_code: str,
+        target_expr: str,
+        check: PropertyCheck,
+        inputs: List[Dict[str, Any]],
+        prop: AbstractProperty,
+    ) -> Optional[Path]:
+        if not inputs:
+            LOGGER.debug("Fallback PBT para %s ignorado: nenhuma entrada disponível.", slug)
+            return None
+        check_code = textwrap.dedent(check.get("code") or "").strip()
+        lines: List[str] = [
+            "# Auto-generated by TesterAgent (fallback). Do not edit.",
+            "import pytest",
+            "from hypothesis import given, strategies as st",
+        ]
         if loader_code:
             lines.extend(loader_code.splitlines())
         if check_code:
@@ -678,11 +1189,10 @@ class TesterAgent:
         description = check.get("description") or prop.get("description")
         if description:
             lines.append(f"# {description}")
-        lines.append(f"@pytest.mark.parametrize('inputs', _TEST_INPUTS)")
+        lines.append("@given(st.sampled_from(_TEST_INPUTS))")
         lines.append(f"def test_property_{slug}(inputs):")
         lines.append(f"    result = {target_expr}(**inputs)")
         lines.append(f"    assert bool({check.get('function_name')}(inputs, result))")
-
         test_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if test_path not in self._active_test_files:
             self._active_test_files.append(test_path)
@@ -702,6 +1212,8 @@ class TesterAgent:
     def _execute_property_checks(
         self,
         state: State,
+        issues_summary: str,
+        new_file_content: str,
     ) -> Tuple[
         bool,
         str,
@@ -769,34 +1281,27 @@ class TesterAgent:
                     check_func = self._compile_property_check(check)
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.warning(
-                        "[%s] Verificador reaproveitado inválido; regenerando. Motivo: %s",
+                        "[%s] Verificador reaproveitado inválido; não será regenerado automaticamente. Motivo: %s",
                         property_name,
                         exc,
                     )
+                    message = (
+                        f"[{property_name}] Verificador existente inválido e geração automática via LLM foi desativada."
+                    )
+                    log_lines.append(message)
+                    errors.append(message)
                     check = None
+                    continue
 
             if not check:
-                try:
-                    check = self._generate_property_check(prop, pos_examples, neg_examples, property_name)
-                except Exception as exc:  # noqa: BLE001
-                    message = f"[{property_name}] Falha ao gerar verificador: {exc}"
-                    LOGGER.error(message)
-                    log_lines.append(message)
-                    errors.append(message)
-                    overall_ok = False
-                    continue
-                try:
-                    check_func = self._compile_property_check(check)
-                except Exception as exc:  # noqa: BLE001
-                    message = f"[{property_name}] Verificador inválido: {exc}"
-                    LOGGER.error(message)
-                    log_lines.append(message)
-                    errors.append(message)
-                    overall_ok = False
-                    continue
-            else:
-                if not check.get("property_name"):
-                    check["property_name"] = property_name  # type: ignore[index]
+                message = (
+                    f"[{property_name}] Nenhum verificador disponível; geração automática via LLM está desativada."
+                )
+                log_lines.append(message)
+                errors.append(message)
+                continue
+            if not check.get("property_name"):
+                check["property_name"] = property_name  # type: ignore[index]
 
             if check_func is None:
                 message = f"[{property_name}] Verificador não pôde ser compilado."
@@ -847,20 +1352,6 @@ class TesterAgent:
                     inputs_dict = sample.get("inputs", {})
                     if isinstance(inputs_dict, dict) and inputs_dict not in candidate_inputs:
                         candidate_inputs.append(inputs_dict)
-            try:
-                test_file = self._write_property_test_module(prop, property_name, check, candidate_inputs)
-                if test_file:
-                    generated_test_files.append(test_file)
-                    try:
-                        test_location = test_file.relative_to(self.repo_root)
-                    except ValueError:
-                        test_location = test_file
-                    log_lines.append(f"[{property_name}] Testes gerados em {test_location}.")
-            except Exception as exc:  # noqa: BLE001
-                message = f"[{property_name}] Falha ao escrever arquivo de testes gerados: {exc}"
-                LOGGER.error(message)
-                log_lines.append(message)
-
             runtime_ok, runtime_logs, violation_detail = self._execute_property_runtime(
                 prop,
                 property_name,
@@ -874,6 +1365,34 @@ class TesterAgent:
                 failure_details.append(violation_detail)
             if not runtime_ok:
                 overall_ok = False
+                log_lines.append(
+                    f"[{property_name}] Testes não gerados devido à falha na execução da propriedade."
+                )
+                continue
+
+            try:
+                test_file = self._write_property_test_module(
+                    prop,
+                    property_name,
+                    check,
+                    candidate_inputs,
+                    state,
+                    issues_summary,
+                    new_file_content,
+                    pos_examples,
+                    neg_examples,
+                )
+                if test_file:
+                    generated_test_files.append(test_file)
+                    try:
+                        test_location = test_file.relative_to(self.repo_root)
+                    except ValueError:
+                        test_location = test_file
+                    log_lines.append(f"[{property_name}] Testes gerados em {test_location}.")
+            except Exception as exc:  # noqa: BLE001
+                message = f"[{property_name}] Falha ao escrever arquivo de testes gerados: {exc}"
+                LOGGER.error(message)
+                log_lines.append(message)
 
         summary = "\n".join(log_lines).strip()
         if not summary:
@@ -1060,7 +1579,7 @@ class TesterAgent:
             property_errors,
             property_failures,
             generated_test_files,
-        ) = self._execute_property_checks(state)
+        ) = self._execute_property_checks(state, issues_summary, tested_code)
 
         extra_sections: List[Tuple[str, str]] = [("issues", issues_summary)]
         if tested_code:

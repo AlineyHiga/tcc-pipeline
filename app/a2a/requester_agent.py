@@ -17,7 +17,7 @@ Given a list of SonarQube issues for a single file and the file contents, craft 
 Structure the response with three short sections:
 - Overview: one sentence summarising the affected file and the number of issues.
 - Issues: bullet list where each item follows "Line <number>: <short description> (<rule>)".
-- Notes: include only if there is tester or sonar feedback worth highlighting.
+- Notes: include tester, sonar, or fixer feedback when available (e.g., failures from previous fixer attempts).
 Keep the result under 150 words and avoid repetition.
 """
 
@@ -82,6 +82,11 @@ class RequesterAgent:
         tester_focus = state.get("tester_feedback_summary")
         sonar_feedback = state.get("sonar_summary")
         tester_generated = list(state.get("tester_generated_test_files") or [])
+        fixer_feedback = (
+            state.get("fixer_summary")
+            if state.get("fix_failed") and state.get("fixer_summary")
+            else None
+        )
 
         prompt = self._build_prompt(
             display_path,
@@ -91,6 +96,7 @@ class RequesterAgent:
             tester_focus,
             tester_generated,
             sonar_feedback,
+            fixer_feedback,
         )
         llm_summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
 
@@ -104,6 +110,7 @@ class RequesterAgent:
             tester_focus,
             tester_cases,
             tester_generated,
+            fixer_feedback,
         )
 
         processed.add(component)
@@ -250,6 +257,7 @@ class RequesterAgent:
         tester_focus: Optional[str],
         tester_generated: List[str],
         sonar_feedback: Optional[str],
+        fixer_feedback: Optional[str],
     ) -> str:
         issue_lines = "\n".join(self._format_issue_list(issues))
         feedback_lines = []
@@ -262,6 +270,8 @@ class RequesterAgent:
             feedback_lines.append(f"Testes gerados: {generated_text}")
         if sonar_feedback:
             feedback_lines.append(f"Sonar feedback: {sonar_feedback.strip()}")
+        if fixer_feedback:
+            feedback_lines.append(f"Fixer falhou anteriormente: {fixer_feedback.strip()}")
         feedback_block = "\n".join(feedback_lines) if feedback_lines else ""
         return "\n".join(
             filter(
@@ -284,6 +294,7 @@ class RequesterAgent:
         tester_focus: Optional[str],
         tester_cases: List[Dict[str, Any]],
         tester_generated: List[str],
+        fixer_feedback: Optional[str],
     ) -> str:
         lines = [
             f"Arquivo alvo: {file_path}",
@@ -300,7 +311,9 @@ class RequesterAgent:
                 lines.append("Casos destacados pelo tester:\n" + "\n".join(formatted_cases))
         if tester_generated:
             lines.append("Arquivos de testes gerados:\n" + "\n".join(f"- {path}" for path in tester_generated))
-        lines.append("Código completo:\n" + file_text)
+        if fixer_feedback:
+            lines.append("Falha anterior do Fixer:\n" + fixer_feedback.strip())
+        lines.append("Código completo fornecido separadamente com numeração de linhas para referência do Fixer.")
         return "\n".join(lines)
 
     def _truncate(self, text: str) -> str:
