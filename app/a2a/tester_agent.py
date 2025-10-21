@@ -132,6 +132,50 @@ class TesterAgent:
         output = (proc.stdout or "") + (proc.stderr or "")
         return proc.returncode == 0, output, False
 
+    def _collect_property_test_paths(self, state: State) -> Tuple[List[Path], List[str]]:
+        paths: List[Path] = []
+        missing: List[str] = []
+        for entry in list(state.get("property_test_files") or []):
+            candidate = Path(entry)
+            if not candidate.is_absolute():
+                candidate = (self.repo_root / candidate).resolve()
+            if candidate.exists():
+                paths.append(candidate)
+            else:
+                missing.append(candidate.as_posix())
+        if not paths:
+            fallback_dir = self.generated_test_root
+            if fallback_dir.exists():
+                for candidate in sorted(fallback_dir.glob("test_property_*.py")):
+                    if candidate.exists() and candidate.is_file():
+                        paths.append(candidate.resolve())
+                if paths:
+                    LOGGER.info(
+                        "PropertyTester adotou fallback: %d arquivo(s) encontrados em %s",
+                        len(paths),
+                        fallback_dir,
+                    )
+        return paths, missing
+
+    def _run_property_pytests(self, files: List[Path]) -> Tuple[bool, str, bool]:
+        if not files:
+            return False, "Nenhum arquivo de testes de propriedade foi fornecido.", False
+        command = ["pytest", "-q", *[str(path) for path in files]]
+        LOGGER.info(
+            "Executando pytest para propriedades (%d arquivo[s]): %s",
+            len(files),
+            ", ".join(path.as_posix() for path in files),
+        )
+        success, output, missing = self._run_command(command)
+        trimmed_output = output.strip()
+        if missing:
+            LOGGER.warning("Pytest não disponível para testes de propriedades.")
+        elif success:
+            LOGGER.info("Pytest de propriedades concluído com sucesso.")
+        else:
+            LOGGER.warning("Pytest de propriedades falhou.\n%s", trimmed_output or "(sem saída)")
+        return success, output, missing
+
     # Property-based testing helpers -------------------------------------
     def _parse_json_response(self, raw: str, label: str) -> Any:
         def _attempt(candidate: str) -> Optional[Any]:
@@ -1489,6 +1533,27 @@ class TesterAgent:
             "message": snippet,
         }
 
+    def _did_property_tests_fail(self, logs: str) -> bool:
+        if not logs:
+            LOGGER.debug("Property test logs vazios; nenhuma falha detectada.")
+            return False
+
+        # Look for pytest summary lines that explicitly mark a property test as failed.
+        failure_line_pattern = re.compile(r"^(FAILED|ERROR)\s+.*\btest_property_", re.MULTILINE)
+        if failure_line_pattern.search(logs):
+            LOGGER.debug("Falha de propriedade detectada via linha de resumo do pytest.")
+            return True
+
+        # Fallback: inspect individual lines that mention property tests and check for failure markers.
+        for line in logs.splitlines():
+            if "test_property_" not in line:
+                continue
+            if re.search(r"\b(FAILED|ERROR|XPASS|XFAIL|xpass|xfail)\b", line):
+                LOGGER.debug("Falha de propriedade detectada na linha: %s", line.strip())
+                return True
+        LOGGER.debug("Nenhuma falha de propriedade identificada nos logs recentes.")
+        return False
+
     def _format_failure_summary(self, case: Dict[str, Any]) -> str:
         if not case:
             return ""
@@ -1566,9 +1631,123 @@ class TesterAgent:
         return pytest_ok, lint_passed, aggregate_logs
 
     def invoke(self, state: State) -> State:
+        mode = str(state.pop("tester_mode", "full")).strip().lower()
+        property_only = mode == "properties"
+
         tested_code = self._load_tested_file_contents(state) or ""
         issues_summary = self._summarize_issues(state)
-        self._maybe_generate_properties(state, tested_code, issues_summary)
+
+        if property_only:
+            property_paths, missing_files = self._collect_property_test_paths(state)
+            sections: List[str] = []
+            if missing_files:
+                sections.append(
+                    "Arquivos de propriedade ausentes:\n" + "\n".join(sorted(set(missing_files)))
+                )
+            property_ok = False
+            property_logs = ""
+            property_failures: List[Dict[str, Any]] = []
+            primary_failure: Dict[str, Any] = {}
+            feedback_summary = ""
+            generated_files_rel: List[str] = []
+
+            for path in property_paths:
+                try:
+                    generated_files_rel.append(str(path.relative_to(self.repo_root)))
+                except ValueError:
+                    generated_files_rel.append(path.as_posix())
+
+            command_ok = False
+            command_logs = ""
+            command_missing_tool = False
+            if property_paths:
+                command_ok, command_logs, command_missing_tool = self._run_property_pytests(property_paths)
+                property_ok = command_ok and not command_missing_tool
+                sections.append(command_logs.strip() or "(sem saída)")
+            else:
+                property_ok = False
+                sections.append("Nenhum arquivo de teste de propriedade disponível para execução.")
+
+            if command_missing_tool:
+                property_ok = False
+                sections.append("Execução abortada: pytest não está disponível no ambiente atual.")
+
+            property_logs = "\n\n".join(section for section in sections if section).strip()
+            if not property_ok:
+                failure_case = self._extract_pytest_failure(property_logs)
+                if failure_case:
+                    failure_case["stage"] = failure_case.get("stage") or "property_test"
+                    property_failures.append(failure_case)
+                    primary_failure = dict(failure_case)
+                    feedback_summary = self._format_failure_summary(failure_case)
+                else:
+                    fallback_message = property_logs or "Falha desconhecida durante os testes de propriedade."
+                    fallback_case = {
+                        "type": "pytest",
+                        "stage": "property_test",
+                        "inputs": {},
+                        "output": None,
+                        "message": fallback_message,
+                    }
+                    property_failures.append(fallback_case)
+                    primary_failure = dict(fallback_case)
+                    feedback_summary = fallback_message.splitlines()[0] if fallback_message else ""
+
+            summary = ""
+            if property_ok:
+                summary = "Property-based test suite passed."
+            else:
+                if property_paths and not command_missing_tool:
+                    summary_prompt = "Logs de propriedades:\n" + (property_logs or "(sem saída)")
+                    summary = self.llm.invoke(SYSTEM_TESTER, summary_prompt)
+                    llm_failure = {
+                        "type": "llm_summary",
+                        "stage": "property_test",
+                        "inputs": {},
+                        "output": None,
+                        "message": summary.strip(),
+                    }
+                    property_failures.append(llm_failure)
+                    if not feedback_summary:
+                        feedback_summary = summary.splitlines()[0] if summary else ""
+                    summary = summary.strip()
+                    if summary and feedback_summary:
+                        summary += f"\n\nFalha principal identificada: {feedback_summary}"
+                else:
+                    summary = (feedback_summary or property_logs or "Testes de propriedade não foram executados.").strip()
+                    if not summary:
+                        summary = "Testes de propriedade não foram executados."
+
+            state_updates: Dict[str, Any] = {
+                "tester_file_contents": tested_code,
+                "tester_issue_summary": issues_summary,
+                "property_summary": property_logs,
+                "property_failures": property_failures,
+                "property_tests_passed": property_ok,
+                "property_checks": [],
+                "property_inputs": [],
+                "property_generators": [],
+                "property_check_errors": [],
+                "tester_generated_test_files": generated_files_rel,
+                "test_passed": None,
+                "lint_passed": None,
+                "test_output": property_logs,
+                "test_logs": property_logs,
+                "tester_summary": summary,
+                "tester_feedback_cases": property_failures,
+                "tester_primary_failure": property_failures[0] if property_failures else primary_failure,
+                "tester_feedback_summary": feedback_summary,
+            }
+            state.update(state_updates)
+            LOGGER.info(
+                "Resultado dos testes de propriedade (modo property_only): property_ok=%s, arquivos=%s",
+                property_ok,
+                ", ".join(generated_files_rel) if generated_files_rel else "(nenhum arquivo)",
+            )
+            return state
+
+        if not state.get("property_test_files"):
+            self._maybe_generate_properties(state, tested_code, issues_summary)
 
         (
             property_ok,
@@ -1580,6 +1759,65 @@ class TesterAgent:
             property_failures,
             generated_test_files,
         ) = self._execute_property_checks(state, issues_summary, tested_code)
+
+        generated_files_rel: List[str] = []
+        for path in generated_test_files:
+            try:
+                generated_files_rel.append(str(path.relative_to(self.repo_root)))
+            except ValueError:
+                generated_files_rel.append(str(path))
+        property_files_rel = [
+            str(item) for item in state.get("property_test_files") or []
+        ]
+        for entry in property_files_rel:
+            if entry not in generated_files_rel:
+                generated_files_rel.append(entry)
+        property_failure_records = [dict(item) for item in property_failures]
+        for record in property_failure_records:
+            record.pop("score", None)
+        feedback_cases_clean = list(property_failure_records)
+        primary_case_clean = None
+        feedback_summary = ""
+
+        if property_files_rel and (
+            not property_logs
+            or property_logs.strip() == "Nenhuma propriedade fornecida; testes baseados em propriedades não executados."
+        ):
+            property_logs = (
+                "Testes de propriedade fornecidos por PropertyAgent: "
+                + ", ".join(property_files_rel)
+            )
+
+        state_updates: Dict[str, Any] = {
+            "property_summary": property_logs,
+            "property_checks": property_checks,
+            "property_inputs": property_inputs,
+            "property_generators": generator_scripts,
+            "property_check_errors": property_errors,
+            "property_failures": property_failures,
+            "tester_generated_test_files": generated_files_rel,
+            "property_tests_passed": property_ok,
+            "tester_file_contents": tested_code,
+            "tester_issue_summary": issues_summary,
+            "tester_feedback_cases": feedback_cases_clean,
+            "tester_primary_failure": {},
+            "tester_feedback_summary": "",
+        }
+
+        if property_only:
+            summary_prompt = "Logs de propriedades:\n" + property_logs
+            summary = self.llm.invoke(SYSTEM_TESTER, summary_prompt)
+            state_updates.update(
+                {
+                    "test_passed": None,
+                    "lint_passed": None,
+                    "test_output": property_logs,
+                    "test_logs": property_logs,
+                    "tester_summary": summary,
+                }
+            )
+            state.update(state_updates)
+            return state
 
         extra_sections: List[Tuple[str, str]] = [("issues", issues_summary)]
         if tested_code:
@@ -1594,13 +1832,28 @@ class TesterAgent:
             pytest_ok,
             logs,
         )
-        generated_files_rel: List[str] = []
-        for path in generated_test_files:
-            try:
-                generated_files_rel.append(str(path.relative_to(self.repo_root)))
-            except ValueError:
-                generated_files_rel.append(str(path))
         self._cleanup_generated_tests(overall_tests_ok)
+        property_tests_passed_flag = property_ok
+        did_property_fail = False
+        if not pytest_ok:
+            did_property_fail = self._did_property_tests_fail(logs)
+            if did_property_fail:
+                property_tests_passed_flag = False
+                if primary_case:
+                    failure_entry = dict(primary_case)
+                else:
+                    failure_entry = {
+                        "type": "pytest",
+                        "stage": "property_test",
+                        "inputs": {},
+                        "output": None,
+                        "message": logs,
+                    }
+                failure_entry.pop("score", None)
+                failure_entry["stage"] = failure_entry.get("stage") or "property_test"
+                if failure_entry not in property_failure_records:
+                    property_failure_records.append(failure_entry)
+
         feedback_cases_clean = [dict(item) for item in feedback_cases]
         for item in feedback_cases_clean:
             item.pop("score", None)
@@ -1609,40 +1862,54 @@ class TesterAgent:
             primary_case_clean.pop("score", None)
 
         prompt = "Logs de teste e lint:\n" + logs
-        summary = self.llm.invoke(SYSTEM_TESTER, prompt)
-        if feedback_summary:
-            summary = summary.strip()
-            if summary:
-                summary += "\n\n"
-            summary += f"Falha principal identificada: {feedback_summary}"
-        if not overall_tests_ok and generated_files_rel:
-            summary = summary.strip()
-            if summary:
-                summary += "\n\n"
-            summary += "Testes gerados mantidos em: " + ", ".join(generated_files_rel)
-        elif overall_tests_ok and generated_files_rel:
-            summary = summary.strip()
-            if summary:
-                summary += "\n\n"
-            summary += "Testes gerados foram limpos após execução bem-sucedida."
+        if overall_tests_ok:
+            summary = "pytest suite and property-based tests passed."
+            if generated_files_rel:
+                summary = summary.strip()
+                if summary:
+                    summary += "\n\n"
+                summary += "Test modules executed: " + ", ".join(generated_files_rel)
+        else:
+            summary = self.llm.invoke(SYSTEM_TESTER, prompt)
+            llm_failure = {
+                "type": "llm_summary",
+                "stage": "test_suite",
+                "inputs": {},
+                "output": None,
+                "message": summary.strip(),
+            }
+            property_failure_records.append(llm_failure)
+            if feedback_summary:
+                summary = summary.strip()
+                if summary:
+                    summary += "\n\n"
+                summary += f"Falha principal identificada: {feedback_summary}"
+            if generated_files_rel:
+                summary = summary.strip()
+                if summary:
+                    summary += "\n\n"
+                summary += "Testes gerados mantidos em: " + ", ".join(generated_files_rel)
 
-        state.update({
-            "test_passed": overall_tests_ok,
-            "lint_passed": lint_ok,
-            "test_output": logs,
-            "test_logs": logs,
-            "tester_summary": summary,
-            "property_summary": property_logs,
-            "property_checks": property_checks,
-            "property_inputs": property_inputs,
-            "property_generators": generator_scripts,
-            "property_check_errors": property_errors,
-            "property_failures": property_failures,
-            "tester_file_contents": tested_code,
-            "tester_issue_summary": issues_summary,
-            "tester_feedback_cases": feedback_cases_clean,
-            "tester_primary_failure": primary_case_clean or {},
-            "tester_feedback_summary": feedback_summary,
-            "tester_generated_test_files": generated_files_rel,
-        })
+        state_updates["property_failures"] = property_failure_records
+        state_updates["property_tests_passed"] = property_tests_passed_flag
+        state_updates.update(
+            {
+                "test_passed": overall_tests_ok,
+                "lint_passed": lint_ok,
+                "test_output": logs,
+                "test_logs": logs,
+                "tester_summary": summary,
+                "tester_feedback_cases": feedback_cases_clean,
+                "tester_primary_failure": primary_case_clean or {},
+                "tester_feedback_summary": feedback_summary,
+            }
+        )
+        LOGGER.info(
+            "Resultado dos testes de propriedade (modo full): property_ok=%s, pytest_ok=%s, property_tests_passed=%s, falha_detectada=%s",
+            property_ok,
+            pytest_ok,
+            property_tests_passed_flag,
+            did_property_fail,
+        )
+        state.update(state_updates)
         return state

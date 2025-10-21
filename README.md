@@ -7,9 +7,11 @@ Pipeline ponta-a-ponta inspirado no framework PGS (Property-Guided Synthesis) qu
 1. Executa `sonar-scanner` para análise estática inicial.
 2. Coleta issues do projeto no SonarQube.
 3. Para cada issue é criada uma sessão A2A/LangGraph:
+   - **Property Agent** seleciona o arquivo afetado e orienta a geração de propriedades Hypothesis.
+   - **Tester Agent (modo propriedades)** gera e executa apenas os testes de propriedades; se falhar, a pipeline encerra antes do Requester.
    - **Requester Agent** monta o contexto com código, issue e feedback acumulado.
    - **Fixer Agent** propõe um patch (diff) e o aplica via `git apply`.
-   - **Tester Agent** roda `pytest` + Hypothesis e converte os logs em feedback semântico.
+   - **Tester Agent** roda `pytest` + propriedades geradas e converte os logs em feedback semântico.
    - **Sonar Agent** reexecuta o `sonar-scanner` para validar a correção.
    - **PR Agent** cria branch, commit e Pull Request se tudo passar.
    - Caso qualquer etapa falhe, o contexto é enriquecido com o feedback e o loop continua até `MAX_ROUNDS`.
@@ -26,6 +28,7 @@ Pipeline ponta-a-ponta inspirado no framework PGS (Property-Guided Synthesis) qu
 │  ├─ llm_client.py           # Abstração para OpenAI ou LLM local (llama.cpp)
 │  └─ a2a/
 │     ├─ protocol.py          # Estruturas de estado e tipos
+│     ├─ property_agent.py    # Seleciona componentes e inicia propriedades
 │     ├─ requester_agent.py   # Gera contexto para o Fixer
 │     ├─ fixer_agent.py       # Gera patch em diff unificado
 │     └─ tester_agent.py      # Pytest/Hypothesis + resumo LLM

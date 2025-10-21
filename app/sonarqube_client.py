@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -95,6 +96,53 @@ class SonarQubeClient:
             params["p"] += 1
         LOGGER.info("Fetched %d Sonar issues", len(issues))
         return issues
+
+    def wait_for_ce_task(
+        self,
+        ce_task_id: str,
+        *,
+        timeout: float = 120.0,
+        poll_interval: float = 2.0,
+    ) -> dict:
+        """Block until the Sonar background task reaches a terminal state."""
+        if not ce_task_id:
+            raise ValueError("ce_task_id must be provided")
+
+        deadline = time.monotonic() + timeout
+        last_status: Optional[str] = None
+
+        while True:
+            resp = self._session.get(
+                self._url("/api/ce/task"),
+                params={"id": ce_task_id},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            payload = resp.json() or {}
+            task = payload.get("task") or {}
+            status = (task.get("status") or "").upper()
+
+            if status == "SUCCESS":
+                LOGGER.info("Sonar background task %s finalized with SUCCESS", ce_task_id)
+                return task
+
+            if status in {"FAILED", "CANCELED"}:
+                message = task.get("errorMessage") or f"Status {status}"
+                raise RuntimeError(
+                    f"Sonar background task {ce_task_id} ended with {status}: {message}"
+                )
+
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timeout waiting for Sonar background task {ce_task_id}"
+                    f" (last status: {status or 'UNKNOWN'})"
+                )
+
+            if status and status != last_status:
+                LOGGER.debug("Sonar background task %s status -> %s", ce_task_id, status)
+                last_status = status
+
+            time.sleep(poll_interval)
 
 
 def format_issue(issue: SonarIssue) -> str:

@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 from app.a2a.protocol import Issue, State
 from app.sonarqube_client import SonarQubeClient, format_issue
@@ -16,6 +16,24 @@ LOGGER = logging.getLogger(__name__)
 def _resolve_repo_root(state: State) -> Path:
     root = state.get("repo_root") or os.getenv("AUTOFIX_TARGET_ROOT") or os.getenv("A2A_REPO_ROOT") or Path.cwd()
     return Path(root).expanduser().resolve()
+
+
+def _read_report_metadata(repo_root: Path) -> Dict[str, str]:
+    report_path = repo_root / ".scannerwork" / "report-task.txt"
+    metadata: Dict[str, str] = {}
+    try:
+        with report_path.open("r", encoding="utf-8") as handler:
+            for line in handler:
+                line = line.strip()
+                if not line or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                metadata[key] = value
+    except FileNotFoundError:
+        LOGGER.warning("Arquivo report-task.txt não encontrado em %s", report_path)
+    except OSError as exc:  # pragma: no cover - defensive logging
+        LOGGER.warning("Falha ao ler report-task.txt em %s: %s", report_path, exc)
+    return metadata
 
 
 def invoke(state: State) -> State:
@@ -34,7 +52,25 @@ def invoke(state: State) -> State:
             }
         )
         return state
+    metadata = _read_report_metadata(repo_root)
     client = SonarQubeClient()
+    ce_task_id = metadata.get("ceTaskId")
+    if ce_task_id:
+        try:
+            client.wait_for_ce_task(ce_task_id)
+        except (RuntimeError, TimeoutError) as exc:
+            message = f"Falha ao aguardar processamento do Sonar: {exc}"
+            LOGGER.error(message)
+            state.update(
+                {
+                    "sonar_passed": False,
+                    "sonar_summary": message,
+                }
+            )
+            return state
+    else:
+        LOGGER.warning("Metadados do Sonar não contém ceTaskId; prosseguindo sem aguardar a fila")
+
     issues = client.search_issues(statuses=("OPEN", "REOPENED", "CONFIRMED"), resolved=False)
     if issues:
         formatted_issues = "\n\n".join(format_issue(issue) for issue in issues)
@@ -79,8 +115,23 @@ def invoke(state: State) -> State:
         {
             "sonar_passed": not remaining,
             "sonar_summary": summary,
+            "sonar_remaining_issues": remaining,
         }
     )
+
+    if remaining:
+        LOGGER.info(
+            "Sonar identificou %d issue(s) remanescente(s) para o arquivo alvo",
+            len(remaining),
+        )
+        state["issues_scoped"] = remaining
+        state["issues_for_file"] = remaining
+        state["issue"] = remaining[0]
+    else:
+        state.pop("issues_scoped", None)
+        state["issues_for_file"] = []
+        state.pop("sonar_remaining_issues", None)
+
     LOGGER.info("Sonar agent finalizado: %s", summary)
     return state
 

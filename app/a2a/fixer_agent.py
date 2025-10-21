@@ -30,11 +30,12 @@ You are the programmer. Consume the context prepared by the Requester and return
 Instructions:
 - Analyse the SonarQube issue that was reported.
 - Fix ONLY the specific problem that is mentioned.
-- Apply the correction across the entire file while keeping behaviour and structure intact.
+- Keep all unaffected code exactly as it is; make the minimal edits necessary to resolve the issue.
 - Return ONLY the final Python source inside a single ```python``` block (no explanations, diffs, ou texto adicional). O bloco deve conter o arquivo completo, linha por linha, incluindo partes que não foram alteradas; nunca use reticências, placeholders ou comentários como “restante inalterado”.
 - Preserve indentation and formatting.
-- Preserve every existing top-level function and class along with their original names; do not remove, rename, or add new top-level elements unless the issue explicitly requires it.
-- Ignore any line numbers in the provided source and return code without them.
+- Preserve every existing top-level function and class along with their original names; do not remove or rename them unless the issue explicitly requires it. You may add new helpers if needed, mas mantenha tudo o que já existe.
+- Ignore any line numbers in the provided source and return code sem numeração.
+- do not change the names of the functions variable
 """
 
 
@@ -57,17 +58,17 @@ class FixerAgent:
         self.prompt = ChatPromptTemplate.from_messages(
             [
                 (
-                    "human",
+                    "system",
                     "You will receive a SonarQube issue and must reply with the fully corrected Python file.\n"
-                    "Rule: {issue_rule}\n"
-                    "Message: {issue_message}\n"
                     "File: {target_path}\n"
-                    "Additional context:\n{requester_context}\n\n"
+                    "Existing top-level definitions (they must remain and keep the same names): {required_definitions}\n"
+                    "\n{requester_context}\n\n"
                     "Original code (line numbers included for reference):\n{original_code}\n\n"
                     "Return only one ```python``` block containing the entire file with the applied fix. "
                     "Do not include line numbers in your response. "
+                    "Do not change the names of the functions. "
+                    "You may add new helper definitions if needed, but never remove or rename the existing ones unless explicitly instructed. "
                     "The block must include the entire file content, without ellipses or omitted sections. "
-                    "All original top-level functions or classes must remain present with the same names unless the issue explicitly demands a change.",
                 )
             ]
         )
@@ -99,6 +100,8 @@ class FixerAgent:
         original_content = resolved_path.read_text()
         LOGGER.debug("Original file size: %d chars", len(original_content))
         original_with_numbers = with_line_numbers(original_content)
+        original_defs = self._collect_top_level_defs(original_content)
+        required_definitions = ", ".join(sorted(original_defs)) if original_defs else "(nenhuma)"
 
         issues_block = self._render_issue_list(issues_for_file or ([issue] if issue else []))
         issue_rules = [
@@ -112,6 +115,7 @@ class FixerAgent:
             "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
             "issue_message": issues_block,
             "target_path": diff_path,
+            "required_definitions": required_definitions,
             "requester_context": context or "(Contexto indisponível)",
             "original_code": original_with_numbers,
         }
@@ -168,9 +172,9 @@ class FixerAgent:
             })
             return state
 
-        original_defs = self._collect_top_level_defs(original_content)
         fixed_defs = self._collect_top_level_defs(fixed_content)
         missing_defs = sorted(original_defs - fixed_defs)
+        extra_defs = sorted(fixed_defs - original_defs)
         blocked_defs = self._blocked_definition_removals(
             missing_defs,
             issues_for_file or ([issue] if issue else []),
@@ -187,7 +191,8 @@ class FixerAgent:
                 {
                     "fixer_summary": (
                         "Fixer removeu definições obrigatórias: "
-                        f"{', '.join(blocked_defs)}"
+                        f"{', '.join(blocked_defs)}. "
+                        "Refaça o ajuste mantendo todas as funções/classes originais."
                     ),
                     "fix_failed": True,
                 }
@@ -197,6 +202,12 @@ class FixerAgent:
             LOGGER.info(
                 "Fixer autorizou remoção de definições %s devido a instruções explícitas nas issues/contexto.",
                 ", ".join(missing_defs),
+            )
+        if extra_defs:
+            LOGGER.info(
+                "Fixer output for %s adicionou novas definições de topo de arquivo: %s",
+                diff_path,
+                ", ".join(extra_defs),
             )
 
         candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
@@ -268,12 +279,26 @@ class FixerAgent:
         """Resolve file references relative to the configured repo root."""
         if not reference:
             return None
-        candidate_paths = []
-        raw = Path(reference)
-        if raw.is_absolute():
-            candidate_paths.append(raw)
-        candidate_paths.append(self.repo_root / raw)
-        candidate_paths.append(Path.cwd() / raw)
+
+        cleaned = reference.strip().replace("\\", "/")
+        if not cleaned:
+            return None
+
+        hints: List[str] = []
+        if ":" in cleaned:
+            _, suffix = cleaned.split(":", 1)
+            suffix = suffix.lstrip("/")
+            if suffix:
+                hints.append(suffix)
+        hints.append(cleaned)
+
+        candidate_paths: List[Path] = []
+        for hint in hints:
+            raw = Path(hint)
+            if raw.is_absolute():
+                candidate_paths.append(raw)
+            candidate_paths.append(self.repo_root / raw)
+            candidate_paths.append(Path.cwd() / raw)
 
         seen = set()
         for candidate in candidate_paths:
@@ -286,6 +311,48 @@ class FixerAgent:
             seen.add(resolved)
             if resolved.exists():
                 return resolved
+
+        roots = self._candidate_roots()
+        for hint in hints:
+            fallback = self._search_by_suffix(roots, Path(hint))
+            if fallback:
+                return fallback
+        return None
+
+    def _candidate_roots(self) -> List[Path]:
+        roots: List[Path] = []
+
+        def register(path: Optional[Union[str, Path]]) -> None:
+            if not path:
+                return
+            resolved = Path(path).expanduser().resolve()
+            if resolved not in roots:
+                roots.append(resolved)
+
+        register(self.repo_root)
+        for parent in self.repo_root.parents:
+            register(parent)
+        register(Path.cwd())
+        env_root = os.getenv("A2A_REPO_ROOT")
+        if env_root:
+            register(env_root)
+        return roots
+
+    def _search_by_suffix(self, roots: Iterable[Path], path_hint: Path) -> Optional[Path]:
+        parts = tuple(part for part in path_hint.parts if part not in {"", "."})
+        if not parts:
+            return None
+        for root in roots:
+            try:
+                for candidate in root.rglob(parts[-1]):
+                    rel_parts = tuple(part for part in candidate.relative_to(root).parts if part not in {"", "."})
+                    if not rel_parts:
+                        continue
+                    if len(parts) <= len(rel_parts) and rel_parts[-len(parts) :] == parts:
+                        return candidate.resolve()
+            except (OSError, RuntimeError) as exc:  # noqa: BLE001
+                LOGGER.debug("Fixer: falha ao buscar %s em %s (%s)", path_hint, root, exc)
+                continue
         return None
 
     def _format_diff_path(self, absolute: Path, hint: str) -> str:

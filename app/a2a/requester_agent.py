@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.a2a.protocol import Issue, State
 from app.llm_client import LLMClient
+from app.utils import with_line_numbers
 
 LOGGER = logging.getLogger(__name__)
 
@@ -17,6 +18,8 @@ Given a list of SonarQube issues for a single file and the file contents, craft 
 Structure the response with three short sections:
 - Overview: one sentence summarising the affected file and the number of issues.
 - Issues: bullet list where each item follows "Line <number>: <short description> (<rule>)".
+- Instructions: a few sentences on how to fix the issues, focusing on the most critical ones.
+
 - Notes: include tester, sonar, or fixer feedback when available (e.g., failures from previous fixer attempts).
 Keep the result under 150 words and avoid repetition.
 """
@@ -51,7 +54,7 @@ class RequesterAgent:
 
     # Public API ----------------------------------------------------------
     def invoke(self, state: State) -> State:
-        issues = list(state.get("issues") or [])
+        issues = list(state.get("issues_scoped") or state.get("issues") or [])
         if not issues:
             LOGGER.info("Requester não encontrou issues pendentes")
             state.update(
@@ -63,7 +66,25 @@ class RequesterAgent:
             return state
 
         processed: set[str] = set(state.get("processed_components") or [])
-        component, grouped = self._select_component(issues, processed)
+        preferred_component = state.pop("property_component", None)
+        ordered = sorted(issues, key=lambda item: (item.component, item.line or 0, item.key))
+        grouped: List[Issue] = []
+        component: Optional[str] = None
+        if preferred_component:
+            grouped = [candidate for candidate in ordered if candidate.component == preferred_component]
+            if grouped:
+                component = preferred_component
+                LOGGER.debug(
+                    "Requester reutilizando componente %s vindo do PropertyAgent",
+                    preferred_component,
+                )
+            else:
+                LOGGER.warning(
+                    "Requester ignorou componente preferencial %s (não encontrado no conjunto de issues)",
+                    preferred_component,
+                )
+        if component is None:
+            component, grouped = self._select_component(ordered, processed)
         if component is None:
             LOGGER.info("Requester: nenhum arquivo pendente após filtrar componentes processados")
             state.update(
@@ -75,37 +96,38 @@ class RequesterAgent:
             return state
 
         display_path, file_text = self._load_file(component)
+        numbered_file_text = with_line_numbers(file_text)
         summary_items = self._format_issue_list(grouped)
         multi_issue_summary = "\n".join(summary_items)
 
-        tester_feedback = state.get("tester_summary")
-        tester_focus = state.get("tester_feedback_summary")
-        sonar_feedback = state.get("sonar_summary")
-        tester_generated = list(state.get("tester_generated_test_files") or [])
-        fixer_feedback = (
-            state.get("fixer_summary")
-            if state.get("fix_failed") and state.get("fixer_summary")
-            else None
+        tester_feedback = self._compact_text(state.get("tester_summary"))
+        tester_focus = self._compact_text(state.get("tester_feedback_summary"))
+        sonar_feedback = self._compact_text(state.get("sonar_summary"))
+        tester_generated = self._deduplicate_preserve_order(
+            list(state.get("tester_generated_test_files") or [])
         )
+        fixer_feedback = None
+        if state.get("fix_failed"):
+            fixer_feedback = self._compact_text(state.get("fixer_summary"))
 
         prompt = self._build_prompt(
             display_path,
             grouped,
-            file_text,
+            numbered_file_text,
             tester_feedback,
             tester_focus,
             tester_generated,
             sonar_feedback,
             fixer_feedback,
         )
-        llm_summary = self.llm.invoke(SYSTEM_PROMPT, prompt)
+        llm_summary = self._compact_text(self.llm.invoke(SYSTEM_PROMPT, prompt)) or ""
 
         tester_cases = list(state.get("tester_feedback_cases") or [])
 
         context = self._build_context(
             display_path,
             grouped,
-            file_text,
+            numbered_file_text,
             llm_summary,
             tester_focus,
             tester_cases,
@@ -204,10 +226,10 @@ class RequesterAgent:
         for root in roots:
             try:
                 for candidate in root.rglob(parts[-1]):
-                    rel_parts = candidate.relative_to(root).parts
+                    rel_parts = tuple(part for part in candidate.relative_to(root).parts if part not in {"", "."})
                     if not rel_parts:
                         continue
-                    if tuple(rel_parts) == parts[-len(rel_parts) :]:
+                    if len(parts) <= len(rel_parts) and rel_parts[-len(parts) :] == parts:
                         return candidate.resolve()
             except (OSError, RuntimeError) as exc:  # noqa: BLE001
                 LOGGER.debug("Requester: falha ao buscar %s em %s (%s)", path_hint, root, exc)
@@ -248,11 +270,45 @@ class RequesterAgent:
             return f"- Pytest: {message or 'falha registrada pelo pytest'}"
         return f"- {message or 'Falha reportada pelo tester'}"
 
+    def _compact_text(self, text: Optional[str]) -> Optional[str]:
+        if text is None:
+            return None
+        lines = text.splitlines()
+        seen: set[str] = set()
+        compacted: List[str] = []
+        last_blank = True
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if not last_blank and compacted:
+                    compacted.append("")
+                last_blank = True
+                continue
+            normalized = " ".join(stripped.split()).lower()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            compacted.append(stripped)
+            last_blank = False
+        while compacted and not compacted[-1]:
+            compacted.pop()
+        return "\n".join(compacted) if compacted else None
+
+    def _deduplicate_preserve_order(self, items: Iterable[str]) -> List[str]:
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for item in items:
+            if item in seen:
+                continue
+            seen.add(item)
+            ordered.append(item)
+        return ordered
+
     def _build_prompt(
         self,
         file_path: str,
         issues: List[Issue],
-        file_text: str,
+        file_text_numbered: str,
         tester_feedback: Optional[str],
         tester_focus: Optional[str],
         tester_generated: List[str],
@@ -280,7 +336,7 @@ class RequesterAgent:
                     f"Target file: {file_path}",
                     f"Issues detected ({len(issues)}):\n{issue_lines}",
                     feedback_block,
-                    "File contents:\n" + file_text,
+                    "File contents with line numbers:\n" + file_text_numbered,
                 ),
             )
         )
@@ -289,7 +345,7 @@ class RequesterAgent:
         self,
         file_path: str,
         issues: List[Issue],
-        file_text: str,
+        file_text_numbered: str,
         llm_summary: str,
         tester_focus: Optional[str],
         tester_cases: List[Dict[str, Any]],
@@ -313,7 +369,10 @@ class RequesterAgent:
             lines.append("Arquivos de testes gerados:\n" + "\n".join(f"- {path}" for path in tester_generated))
         if fixer_feedback:
             lines.append("Falha anterior do Fixer:\n" + fixer_feedback.strip())
-        lines.append("Código completo fornecido separadamente com numeração de linhas para referência do Fixer.")
+        if file_text_numbered.strip():
+            lines.append("Código com numeração de linhas:\n" + file_text_numbered)
+        else:
+            lines.append("Código do arquivo indisponível.")
         return "\n".join(lines)
 
     def _truncate(self, text: str) -> str:

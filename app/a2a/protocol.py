@@ -17,6 +17,15 @@ class Issue:
 
 class State(TypedDict, total=False):
     abstract_properties: List["AbstractProperty"]
+    property_tests_passed: bool
+    property_attempts: int
+    property_component: str
+    property_processed_components: List[str]
+    property_test_files: List[str]
+    property_generation_summary: str
+    property_generation_failed: bool
+    property_file_preview: str
+    property_absolute_path: str
     property_checks: List["PropertyCheck"]
     property_check_errors: List[str]
     property_generators: List[str]
@@ -28,6 +37,7 @@ class State(TypedDict, total=False):
     issue: Issue
     issues: List[Issue]
     issues_for_file: List[Issue]
+    issues_scoped: List[Issue]
     repo_root: str
     plan_summary: str
     multi_issue_summary: str
@@ -42,6 +52,8 @@ class State(TypedDict, total=False):
     lint_passed: bool
     sonar_summary: str
     sonar_passed: bool
+    sonar_remaining_issues: List[Issue]
+    sonar_feedback_attempts: int
     deployment_summary: str
     file_path: str
     tester_file_contents: str
@@ -55,6 +67,7 @@ class State(TypedDict, total=False):
     feedback_log: str
     fix_failed: bool
     deployment_failed: bool
+    metrics: "Metrics"
 
 
 Role = Literal["requester", "fixer", "tester", "sonar", "deployment"]
@@ -85,3 +98,9 @@ class PropertyCheck(TypedDict, total=False):
     code: str
     function_name: str
     description: str
+
+
+class Metrics(TypedDict, total=False):
+    timings: Dict[str, float]
+    attempts: Dict[str, int]
+    counters: Dict[str, int]
