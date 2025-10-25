@@ -1,2 +1,0 @@
-ASCII indisponivel: instale grandalf para habilitar este formato.
-Detalhes: Install grandalf to draw graphs: `pip install grandalf`.

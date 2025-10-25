@@ -14,7 +14,50 @@ import requests
 LOGGER = logging.getLogger(__name__)
 
 
-def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | Path = ".") -> None:
+def mask_secrets(text: str) -> str:
+    """Mask sensitive tokens in logs."""
+    import re
+    patterns = [
+        (r'(SONAR_TOKEN=|SONARQUBE_TOKEN=)[^\s]+', r'\1***'),
+        (r'(GITHUB_TOKEN=)[^\s]+', r'\1***'),
+        (r'(OPENAI_API_KEY=)[^\s]+', r'\1***'),
+        (r'(squ_)[a-zA-Z0-9]+', r'\1***'),
+        (r'(ghp_)[a-zA-Z0-9]+', r'\1***'),
+        (r'(sk-)[a-zA-Z0-9]+', r'\1***')
+    ]
+    
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text)
+    return text
+
+
+def run_cmd(cmd: list[str], timeout_s: int = 900, workdir: str = ".") -> dict:
+    """Execute command with timeout and capture output."""
+    import time
+    t0 = time.time()
+    try:
+        proc = subprocess.run(
+            cmd, cwd=workdir, capture_output=True, text=True, 
+            timeout=timeout_s, check=False
+        )
+        duration_ms = int((time.time() - t0) * 1000)
+        
+        return {
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "duration_ms": duration_ms
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"Command timed out after {timeout_s}s",
+            "duration_ms": timeout_s * 1000
+        }
+
+
+def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, extra_args: Optional[list[str]] = None, cwd: str | Path = ".") -> None:
     """Execute `sonar-scanner` locally or via the official Docker image."""
     from dotenv import load_dotenv
     repo_root = Path(__file__).resolve().parents[2]
@@ -117,6 +160,8 @@ def run_sonar_scanner(extra_env: Optional[Mapping[str, str]] = None, cwd: str | 
             "sonarsource/sonar-scanner-cli",
         ]
     cmd.extend(property_args)
+    if extra_args:
+        cmd.extend(extra_args)
     LOGGER.info("Project key: %s", env.get('SONAR_PROJECT_KEY'))
     LOGGER.info("SonarQube URL: %s", sonar_url)
     LOGGER.debug("Executing command: %s", " ".join(cmd))

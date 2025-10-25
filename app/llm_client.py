@@ -1,176 +1,186 @@
-"""Unified interface for interacting with either cloud or local LLMs."""
-from __future__ import annotations
-
-import logging
+"""LLM client abstraction for OpenAI and local models."""
 import os
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Optional
+from openai import OpenAI
+from .logging_setup import log_event, save_artifact, sha256_text, get_run_artifacts_dir, should_sample_llm
 
-LOGGER = logging.getLogger(__name__)
 
-DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+def get_llm_client():
+    """Get configured LLM client."""
+    provider = os.getenv("LLM_PROVIDER", "openai")
+    
+    if provider == "openai":
+        return OpenAIClient()
+    else:
+        raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
-class LLMClient:
-    """Dispatches chat completion requests to OpenAI or a local model."""
-
-    def __init__(self, role: str, temperature: float = 0.0) -> None:
-        self.role = role
-        self.temperature = float(temperature)
-        self.provider = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-        self._client = None
-        self.max_completion_tokens = self._coerce_max_tokens(
-            "LLM_MAX_COMPLETION_TOKENS",
-            fallback=4096,
-            allow_zero=False,
+class OpenAIClient:
+    """OpenAI-compatible client (works with Ollama too)."""
+    
+    def __init__(self):
+        self.client = OpenAI(
+            base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.getenv("OPENAI_API_KEY", "")
         )
-        self.local_max_tokens = self._coerce_max_tokens(
-            "LLM_LOCAL_MAX_TOKENS",
-            fallback=0,
-            allow_zero=True,
-        )
-        if self.provider == "local":
-            self._client = self._init_local_client()
-        else:
-            self.provider = "openai"
-            self._client = self._init_openai_client()
-
-    # Public API --------------------------------------------------------------
-    def invoke(self, system_prompt: str, user_prompt: str) -> str:
-        LOGGER.info(
-            "LLM[%s] request\nSYSTEM:\n%s\nUSER:\n%s",
-            self.role,
-            system_prompt.strip(),
-            user_prompt,
-        )
-        if self.provider == "local":
-            response = self._invoke_local(system_prompt, user_prompt)
-        else:
-            response = self._invoke_openai(system_prompt, user_prompt)
-        LOGGER.info("LLM[%s] response\n%s", self.role, response)
-        return response
-
-    # OpenAI path -------------------------------------------------------------
-    def _init_openai_client(self) -> Any:
+        self.model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
+        self.max_tokens = int(os.getenv("LLM_MAX_COMPLETION_TOKENS", "4096"))
+    
+    def generate(self, prompt: str = None, messages: list = None, **kwargs) -> str:
+        """Generate text completion with JSON mode and grammar support."""
+        import time
+        logger = logging.getLogger(__name__)
+        
         try:
-            from langchain_openai import ChatOpenAI
-        except ImportError as exc:  # pragma: no cover - import guard
-            raise RuntimeError(
-                "langchain-openai não está instalado. Instale as dependências via "
-                "`pip install -r requirements.txt` ou configure LLM_PROVIDER=local"
-            ) from exc
-
-        model = os.getenv("OPENAI_MODEL", DEFAULT_OPENAI_MODEL)
-        base_url = os.getenv("OPENAI_BASE_URL")
-        api_key = os.getenv("OPENAI_API_KEY") or ("ollama" if base_url else None)
-
-        if not api_key:
-            raise RuntimeError(
-                "OPENAI_API_KEY não definido. Configure uma chave real ou, para Ollama/local, "
-                "defina OPENAI_API_KEY=ollama e OPENAI_BASE_URL apontando para o endpoint compatível"
-            )
-
-        kwargs: Dict[str, Any] = {
-            "model": model,
-            "temperature": self.temperature,
-            "api_key": api_key,
-        }
-        if base_url:
-            kwargs["base_url"] = base_url
-        if self.max_completion_tokens is not None:
-            kwargs["max_completion_tokens"] = self.max_completion_tokens
-            LOGGER.debug(
-                "LLM[%s] configurado com max_completion_tokens=%s",
-                self.role,
-                self.max_completion_tokens,
-            )
-        return ChatOpenAI(**kwargs)
-
-    def _invoke_openai(self, system_prompt: str, user_prompt: str) -> str:
-        from langchain.schema import HumanMessage, SystemMessage
-
-        messages = [
-            SystemMessage(content=system_prompt.strip()),
-            HumanMessage(content=user_prompt),
-        ]
-        response = self._client.invoke(messages)
-        return getattr(response, "content", "")
-
-    # Local path --------------------------------------------------------------
-    def _init_local_client(self) -> Any:
-        model_path = os.getenv("LLM_LOCAL_MODEL_PATH")
-        if not model_path:
-            raise RuntimeError(
-                "LLM_PROVIDER=local requer LLM_LOCAL_MODEL_PATH apontando para um arquivo GGUF"
-            )
-        chat_format = os.getenv("LLM_LOCAL_CHAT_FORMAT", "llama-2")
-        n_ctx = int(os.getenv("LLM_LOCAL_CTX", "4096"))
-        n_threads = int(os.getenv("LLM_LOCAL_THREADS", "0")) or None
-        try:
-            from llama_cpp import Llama
-        except ImportError as exc:
-            raise RuntimeError(
-                "llama-cpp-python não está instalado. Rode `pip install llama-cpp-python` ou configure "
-                "LLM_PROVIDER=openai."
-            ) from exc
-        LOGGER.info(
-            "Inicializando LLaMA local (modelo=%s, chat_format=%s, ctx=%s)",
-            model_path,
-            chat_format,
-            n_ctx,
-        )
-        return Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            chat_format=chat_format,
-            verbose=False,
-        )
-
-    def _invoke_local(self, system_prompt: str, user_prompt: str) -> str:
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": system_prompt.strip()},
-            {"role": "user", "content": user_prompt},
-        ]
-        kwargs: Dict[str, Any] = {
-            "messages": messages,
-            "temperature": self.temperature,
-        }
-        if self.local_max_tokens is not None:
-            kwargs["max_tokens"] = self.local_max_tokens
-        response = self._client.create_chat_completion(**kwargs)
-        choices = response.get("choices") or []
-        if not choices:
-            raise RuntimeError("Local LLM não retornou escolhas válidas")
-        return choices[0]["message"]["content"].strip()
-
-    @staticmethod
-    def _coerce_max_tokens(
-        env_name: str,
-        fallback: int,
-        allow_zero: bool,
-    ) -> Optional[int]:
-        raw_value = os.getenv(env_name)
-        if raw_value is None or not raw_value.strip():
-            return fallback
-        try:
-            parsed = int(raw_value)
-        except ValueError:
-            LOGGER.warning(
-                "Valor inválido para %s=%r. Utilizando fallback %d.",
-                env_name,
-                raw_value,
-                fallback,
-            )
-            return fallback
-        if parsed < 0:
-            LOGGER.warning(
-                "Valor negativo para %s=%d. Utilizando fallback %d.",
-                env_name,
-                parsed,
-                fallback,
-            )
-            return fallback
-        if parsed == 0 and not allow_zero:
-            LOGGER.info("Valor zero informado em %s; não será aplicado limite explícito.", env_name)
-            return None
-        return parsed
+            # Build messages
+            if messages:
+                msgs = messages
+                full_prompt = "\n".join([m.get("content", "") for m in msgs])
+            else:
+                msgs = [{"role": "user", "content": prompt}]
+                full_prompt = prompt or ""
+            
+            # Build payload
+            model = kwargs.get("model", self.model)
+            temperature = kwargs.get("temperature", 0.0)
+            max_tokens = kwargs.get("max_tokens", self.max_tokens)
+            stop = kwargs.get("stop", [])
+            seed = kwargs.get("seed")
+            top_p = kwargs.get("top_p")
+            
+            payload = {
+                "model": model,
+                "messages": msgs,
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            
+            # Add optional parameters
+            if stop:
+                payload["stop"] = stop
+            if seed is not None:
+                payload["seed"] = seed
+            if top_p is not None:
+                payload["top_p"] = top_p
+            
+            # Grammar/JSON mode detection
+            response_format = kwargs.get("response_format")
+            grammar = kwargs.get("grammar")
+            has_grammar = bool(grammar)
+            grammar_sha256 = sha256_text(str(grammar)) if grammar else None
+            
+            if response_format:
+                payload["response_format"] = response_format
+            if grammar:
+                payload["grammar"] = grammar
+            
+            # Log request
+            prompt_hash = sha256_text(full_prompt)
+            preview = full_prompt[:1000] if full_prompt else ""
+            
+            artifact_path = ""
+            if should_sample_llm():
+                artifact_path = save_artifact(
+                    f"{get_run_artifacts_dir()}/llm",
+                    f"prompt_{prompt_hash}.txt",
+                    full_prompt
+                )
+            
+            request_log = {
+                "model": model,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "prompt_sha256": prompt_hash,
+                "preview": preview,
+                "artifact_path": artifact_path
+            }
+            
+            if seed is not None:
+                request_log["seed"] = seed
+            if stop:
+                request_log["stop"] = stop
+            if top_p is not None:
+                request_log["top_p"] = top_p
+            if has_grammar:
+                request_log["has_grammar"] = True
+                request_log["grammar_sha256"] = grammar_sha256
+            if response_format:
+                request_log["response_format"] = response_format
+            
+            log_event("llm.request", **request_log)
+            
+            # Make API call with timing
+            start_time = time.time()
+            response = self.client.chat.completions.create(**payload)
+            latency_ms = int((time.time() - start_time) * 1000)
+            
+            content = response.choices[0].message.content or ""
+            finish_reason = response.choices[0].finish_reason
+            
+            # Extract usage if available
+            usage = getattr(response, 'usage', None)
+            prompt_tokens = getattr(usage, 'prompt_tokens', None) if usage else None
+            completion_tokens = getattr(usage, 'completion_tokens', None) if usage else None
+            
+            # Detect grammar/parsing results
+            applied_grammar = has_grammar and content
+            stopped_on = None
+            if stop and finish_reason == "stop":
+                for stop_seq in stop:
+                    if stop_seq in content:
+                        stopped_on = stop_seq
+                        break
+            
+            # Parse result detection
+            parsed = False
+            parse_error = None
+            if response_format and response_format.get("type") == "json_object":
+                try:
+                    import json
+                    json.loads(content)
+                    parsed = True
+                except json.JSONDecodeError as e:
+                    parse_error = str(e)[:100]  # Short message
+            
+            # Log response
+            response_hash = sha256_text(content)
+            response_preview = content[:1000] if content else ""
+            
+            response_artifact_path = ""
+            if should_sample_llm():
+                response_artifact_path = save_artifact(
+                    f"{get_run_artifacts_dir()}/llm",
+                    f"response_{response_hash}.txt",
+                    content
+                )
+            
+            response_log = {
+                "finish_reason": finish_reason,
+                "latency_ms": latency_ms,
+                "content_sha256": response_hash,
+                "preview": response_preview,
+                "artifact_path": response_artifact_path
+            }
+            
+            if prompt_tokens is not None:
+                response_log["prompt_tokens"] = prompt_tokens
+            if completion_tokens is not None:
+                response_log["completion_tokens"] = completion_tokens
+            if applied_grammar:
+                response_log["applied_grammar"] = True
+            if stopped_on:
+                response_log["stopped_on"] = stopped_on
+            if response_format and response_format.get("type") == "json_object":
+                response_log["parsed"] = parsed
+                if parse_error:
+                    response_log["parse_error"] = parse_error
+            
+            log_event("llm.response", **response_log)
+            
+            return content
+            
+        except Exception as e:
+            logger.error(f"LLM generation failed: {e}")
+            log_event("llm.error", error=str(e), model=kwargs.get("model", self.model))
+            return ""

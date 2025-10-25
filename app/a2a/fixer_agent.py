@@ -1,853 +1,728 @@
-"""Fixer agent: generates and applies patches based on Requester context."""
-from __future__ import annotations
-
+"""Fixer agent for generating minimal code patches."""
+import re
 import ast
 import difflib
-import hashlib
-import logging
-import os
-import re
-import subprocess
-import tempfile
+from typing import Dict, Any
 from pathlib import Path
-from typing import Iterable, List, Optional, Union
+from ..llm_client import get_llm_client
+from ..rag.retriever import RAGRetriever
 
-from langchain_core.prompts import ChatPromptTemplate
 
-from app.a2a.protocol import State
-from app.llm_client import LLMClient
-from app.utils import with_line_numbers
+def _extract_func_from_llm(txt: str, func_name: str) -> str:
+    """Extract function from LLM response with multiple fallbacks."""
+    # 1) Marcadores
+    m = re.search(r"<<FUNC_NEW>>(.*?)(?:<<END_FUNC>>|$)", txt, re.S)
+    cand = m.group(1).strip() if m else ""
 
-LOGGER = logging.getLogger(__name__)
+    # 2) Bloco ```python
+    if not cand:
+        m = re.search(r"```(?:python)?\s*(.*?)```", txt, re.S | re.I)
+        cand = m.group(1).strip() if m else ""
 
-REMOVAL_KEYWORD_PATTERN = re.compile(
-    r"\b(remove|remover|remova|delete|deletar|eliminate|eliminar|drop|excluir|exclua)\b",
-    re.IGNORECASE,
-)
+    # 3) Varre texto cru por def <func_name>(...):
+    if not cand or f"def {func_name}" not in cand:
+        pat = rf"(?ms)^\s*def\s+{re.escape(func_name)}\s*\([^)]*\):.*?(?=^\s*def\s+|\Z)"
+        m = re.search(pat, txt)
+        cand = m.group(0).strip() if m else ""
 
-SYSTEM_PROMPT = """
-You are the programmer. Consume the context prepared by the Requester and return the full Python file with the requested corrections applied.
-Instructions:
-- Analyse the SonarQube issue that was reported.
-- Fix ONLY the specific problem that is mentioned.
-- Keep all unaffected code exactly as it is; make the minimal edits necessary to resolve the issue.
-- Return ONLY the final Python source inside a single ```python``` block (no explanations, diffs, ou texto adicional). O bloco deve conter o arquivo completo, linha por linha, incluindo partes que não foram alteradas; nunca use reticências, placeholders ou comentários como “restante inalterado”.
-- Preserve indentation and formatting.
-- Preserve every existing top-level function and class along with their original names; do not remove or rename them unless the issue explicitly requires it. You may add new helpers if needed, mas mantenha tudo o que já existe.
-- Ignore any line numbers in the provided source and return code sem numeração.
-- do not change the names of the functions variable
-"""
+    cand = cand.strip().lstrip("`").rstrip("`").strip()
+    if not cand.startswith("def "):
+        raise ValueError("LLM response did not contain a function body")
+
+    return cand + ("" if cand.endswith("\n") else "\n")
+
+
+def build_unified_diff(path: str, old_text: str, new_text: str) -> str:
+    """Generate unified diff locally using difflib."""
+    old_lines = old_text.splitlines(keepends=True)
+    new_lines = new_text.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        old_lines, new_lines,
+        fromfile=f"a/{path}",
+        tofile=f"b/{path}",
+        n=3
+    )
+    return "".join(diff)
+
+
+def validate_diff(text: str) -> tuple[bool, str | None]:
+    """Validate diff text for obvious issues."""
+    if "..." in text:  # típico de preview do LLM
+        return False, "ellipsis_in_diff"
+    if "--- a/" not in text or "+++ b/" not in text or "\n@@ " not in text:
+        return False, "missing_headers_or_hunks"
+    return True, None
+try:
+    from unidiff import PatchSet
+except ImportError:
+    PatchSet = None
+try:
+    import libcst as cst
+    
+    class PrintToLoggerTransformer(cst.CSTTransformer):
+        """Transform print() calls to logger calls."""
+        
+        def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
+            if isinstance(updated_node.func, cst.Name) and updated_node.func.value == "print":
+                return updated_node.with_changes(
+                    func=cst.Attribute(
+                        value=cst.Name("logger"),
+                        attr=cst.Name("info")
+                    )
+                )
+            return updated_node
+    
+except ImportError:
+    cst = None
+    PrintToLoggerTransformer = None
 
 
 class FixerAgent:
-    def __init__(
-        self,
-        temperature: float = 0.1,
-        repo_root: Optional[Union[Path, str]] = None,
-    ) -> None:
-        self.llm = LLMClient(role="fixer", temperature=temperature)
-        env_root = os.getenv("A2A_REPO_ROOT")
-        if repo_root:
-            base = Path(repo_root)
-        elif env_root:
-            base = Path(env_root)
-        else:
-            base = Path.cwd()
-        self.repo_root = base.resolve()
-        LOGGER.debug("Fixer repo root set to %s", self.repo_root)
-        self.prompt = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "You will receive a SonarQube issue and must reply with the fully corrected Python file.\n"
-                    "File: {target_path}\n"
-                    "Existing top-level definitions (they must remain and keep the same names): {required_definitions}\n"
-                    "\n{requester_context}\n\n"
-                    "Original code (line numbers included for reference):\n{original_code}\n\n"
-                    "Return only one ```python``` block containing the entire file with the applied fix. "
-                    "Do not include line numbers in your response. "
-                    "Do not change the names of the functions. "
-                    "You may add new helper definitions if needed, but never remove or rename the existing ones unless explicitly instructed. "
-                    "The block must include the entire file content, without ellipses or omitted sections. "
-                )
-            ]
-        )
-
-    def invoke(self, state: State) -> State:
-        context = state.get("context", "")
-        issues_for_file: List = list(state.get("issues_for_file") or [])
-        issue = state.get("issue")
-
-        LOGGER.debug("Fixer received context with %d chars", len(context))
-        if context:
-            LOGGER.debug("Fixer context preview: %s", context[:500].replace("\n", "\\n"))
-        if issues_for_file:
-            LOGGER.debug("Fixer issues for file: %s", [item.key for item in issues_for_file])
-
-        file_hint = state.get("file_path") or self._extract_file_path(context)
-        LOGGER.debug("Fixer target file path hint: %s", file_hint)
-        resolved_path = self._resolve_file_path(file_hint)
-        if not resolved_path:
-            LOGGER.error("Fixer could not resolve target file: %s", file_hint)
-            state.update({
-                "fixer_summary": "Arquivo não encontrado",
-                "fix_failed": True,
-            })
-            return state
-
-        diff_path = self._format_diff_path(resolved_path, file_hint)
-        LOGGER.debug("Fixer resolved target file to %s (diff path %s)", resolved_path, diff_path)
-        original_content = resolved_path.read_text()
-        LOGGER.debug("Original file size: %d chars", len(original_content))
-        original_with_numbers = with_line_numbers(original_content)
-        original_defs = self._collect_top_level_defs(original_content)
-        required_definitions = ", ".join(sorted(original_defs)) if original_defs else "(nenhuma)"
-
-        issues_block = self._render_issue_list(issues_for_file or ([issue] if issue else []))
-        issue_rules = [
-            getattr(item, "rule", "")
-            for item in (issues_for_file or [])
-            if getattr(item, "rule", "")
-        ]
-
-        LOGGER.info("Fixer gerando patch único para %s", diff_path)
+    """Generates minimal unified diffs to fix Sonar issues."""
+    
+    def __init__(self):
+        self.llm = get_llm_client()
+        self.retriever = RAGRetriever()
+    
+    def fix_plan(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate deterministic fix plan from Sonar issues and AST analysis."""
+        current_lot = state.get("current_lot", {})
+        repo_root = state.get("repo_path", ".")
         
-        # Use enhanced RAG for minimal targeted context
-        try:
-            from app.rag_builder import auto_build_rag_index
-            auto_build_rag_index(self.repo_root)
-            
-            from rag_service.service import RAGService
-            rag_service = RAGService(str(self.repo_root / ".rag_index"))
-            
-            if issues_for_file:
-                issue = issues_for_file[0]
-                result = rag_service.retrieve_for_issue(
-                    file_path=file_hint,
-                    line=getattr(issue, 'line', 1),
-                    rule=getattr(issue, 'rule', ''),
-                    message=getattr(issue, 'message', ''),
-                    k=3  # Minimal context
-                )
-                
-                # Get only the target symbol code (most relevant)
-                target_id = f"{result['target']['path']}::{result['target']['symbol']}"
-                code_map = rag_service.get_code_for_symbols([target_id])
-                
-                if code_map:
-                    target_code = list(code_map.values())[0]
-                    code_context = f"# Target function: {result['target']['symbol']}\n{target_code[:1200]}"
-                    LOGGER.info(f"Fixer using RAG context: {len(target_code)} chars for {result['target']['symbol']}")
-                else:
-                    code_context = original_with_numbers[:1200]
-            else:
-                code_context = original_with_numbers[:2000]
-                
-        except (ImportError, Exception) as e:
-            LOGGER.debug("Enhanced RAG not available, using optimization fallback: %s", e)
-            # Apply token optimizations
-            try:
-                from app.optimizations import TokenOptimizer
-                optimizer = TokenOptimizer()
-                
-                # Use targeted region if we have issues with line numbers
-                if issues_for_file and hasattr(issues_for_file[0], 'line'):
-                    first_issue_line = getattr(issues_for_file[0], 'line', 1)
-                    code_context = optimizer.extract_target_region(original_content, first_issue_line)
-                    
-                    # If the extracted region is too small, expand it
-                    if len(code_context) < 500:
-                        code_context = original_with_numbers[:2000]  # Reduced context
-                else:
-                    code_context = original_with_numbers[:2000]  # Reduced limit
-            except ImportError:
-                code_context = original_with_numbers[:2000]  # Reduced fallback
+        rule_key = current_lot.get("ruleKey", "")
+        issues = current_lot.get("issues", [])
         
-        prompt_input = {
-            "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
-            "issue_message": issues_block,
-            "target_path": diff_path,
-            "required_definitions": required_definitions,
-            "requester_context": (context or "(Contexto indisponível)")[:600],  # Further limit context
-            "original_code": code_context[:1500],  # Limit code context
-        }
-        prompt_value = self.prompt.format_prompt(**prompt_input)
-        user_prompt = prompt_value.to_messages()[0].content
-        LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
-        raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
-        LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
-        
-        # Parse the changes format response
-        changes = self._parse_changes_response(raw_response)
-        if not changes:
-            LOGGER.error("Failed to parse changes from LLM response")
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": "Falha ao interpretar resposta do LLM",
-                "fix_failed": True,
-            })
-            return state
-        
-        # Apply changes to original content
-        fixed_content = self._apply_changes_to_content(original_content, changes)
-        if not fixed_content:
-            LOGGER.error("Failed to apply changes to original content")
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": "Falha ao aplicar mudanças no código original",
-                "fix_failed": True,
-            })
-            return state
-        LOGGER.debug("Applied changes, result size: %d chars", len(fixed_content))
-        
-        # Additional cleaning for HTML entities that might remain
-        fixed_content = fixed_content.replace('&gt;', '>').replace('&lt;', '<').replace('&quot;', '"').replace('&amp;', '&')
-        if fixed_content:
-            preview = fixed_content[:200].replace("\n", "\\n")
-            LOGGER.debug("Sanitized fixer output preview: %s%s", preview, "..." if len(fixed_content) > 200 else "")
-        original_digest = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
-        fixed_digest = hashlib.sha256(fixed_content.encode("utf-8")).hexdigest() if fixed_content else "EMPTY"
-        LOGGER.debug("Content digests — original=%s fixed=%s", original_digest, fixed_digest)
-
-        if self._looks_like_diff_response(fixed_content):
-            LOGGER.warning("Fixer detected diff-like output, sanitizing.")
-            fixed_content = self._sanitize_diff_like_response(
-                fixed_content, diff_path, original_content
-            )
-            LOGGER.debug("Sanitized diff-like response size: %d chars", len(fixed_content))
-
-        if self._has_placeholder_markers(fixed_content):
-            LOGGER.error("Fixer output for %s contém placeholders indicando omissões.", diff_path)
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": (
-                    "Fixer retornou código com trechos omitidos (ex: 'rest of the functions remain unchanged')."
-                ),
-                "fix_failed": True,
-            })
-            return state
-
-        is_valid_python, syntax_error = self._is_valid_python_code(fixed_content)
-        if not is_valid_python:
-            LOGGER.error(
-                "Fixer produced invalid Python source for %s: %s",
-                diff_path,
-                syntax_error or "syntax error",
-            )
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": (
-                    f"Código inválido retornado pelo Fixer: {syntax_error}"
-                    if syntax_error
-                    else "Fixer retornou código inválido"
-                ),
-                "fix_failed": True,
-            })
-            return state
-
-        # Skip top-level definition validation - allow fixer to focus on the specific issue
-        fixed_defs = self._collect_top_level_defs(fixed_content)
-        extra_defs = sorted(fixed_defs - original_defs)
-        if extra_defs:
-            LOGGER.info(
-                "Fixer output for %s adicionou novas definições de topo de arquivo: %s",
-                diff_path,
-                ", ".join(extra_defs),
-            )
-
-        candidate_patch = self._generate_patch(original_content, fixed_content, diff_path)
-        LOGGER.info("Generated patch (first 1k chars): %s", candidate_patch[:1000])
-        LOGGER.debug("Generated patch size: %d chars", len(candidate_patch))
-        if candidate_patch:
-            LOGGER.debug("Candidate patch line count: %d", candidate_patch.count("\n"))
-        else:
-            LOGGER.debug("Candidate patch vazio para %s", diff_path)
-
-        if not candidate_patch or "@@" not in candidate_patch:
-            LOGGER.error("Generated patch missing diff hunks (@@) for %s", diff_path)
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": "Falha ao gerar patch válido",
-                "fix_failed": True,
-            })
-            return state
-
-        applies, patch_error = self._patch_applies(candidate_patch)
-        if not applies:
-            LOGGER.error(
-                "Generated patch failed to apply in dry-run for %s: %s",
-                diff_path,
-                patch_error or "git apply --check retornou código não zero",
-            )
-            state["patch"] = ""
-            state.update({
-                "fixer_summary": (
-                    "Falha ao validar patch: "
-                    f"{patch_error}" if patch_error else "Falha ao validar patch gerado"
-                ),
-                "fix_failed": True,
-            })
-            return state
-
-        state["patch"] = candidate_patch
-        state.update({
-            "fixer_summary": "Patch gerado com sucesso",
-            "fix_failed": False,
-        })
-        return state
-
-    # ---------------------------------------------------------------------
-
-    def _extract_file_path(self, context: str) -> str:
-        """Extract file path from context."""
-        lines = context.split('\n')
-        for line in lines:
-            if 'Arquivo alvo:' in line:
-                return line.split(':', 1)[1].strip()
-        return ""
-
-    def _render_issue_list(self, issues: List) -> str:
         if not issues:
+            return {"goals": [], "steps": [], "touched_files": [], "targets": []}
+        
+        # Build deterministic targets from issues (sorted by severity + gap)
+        targets = self._build_fix_goals(repo_root, current_lot)
+        
+        # Filter touched_files to only real files (no globs)
+        touched_files = []
+        for issue in issues:
+            component = issue.get("component", "")
+            file_path = self._component_rel(component)
+            if file_path:
+                # Check if file exists
+                full_path = Path(repo_root) / file_path if not Path(file_path).is_absolute() else Path(file_path)
+                if full_path.exists() and full_path.is_file():
+                    touched_files.append(str(Path(file_path).as_posix()))
+        
+        # Generate goals text from targets (not LLM)
+        goals_text = []
+        for t in targets:
+            if t.get("from_to") and t["from_to"][0] is not None:
+                goals_text.append(f"Refactor {t['file']}::{t['func_name']} from {t['from_to'][0]} to {t['from_to'][1]} ({t['rule']})")
+            else:
+                goals_text.append(f"Fix {t['rule']} in {t['file']}::{t['func_name']}")
+        
+        # Generate summary from targets
+        summary = []
+        for t in targets:
+            if t.get("from_to") and t["from_to"][0] is not None:
+                summary.append(f"{t['file']}::{t['func_name']} {t['from_to'][0]}→{t['from_to'][1]}")
+            else:
+                summary.append(f"{t['file']}::{t['func_name']}")
+        
+        return {
+            "targets": targets,
+            "summary": summary,
+            "goals": goals_text,
+            "steps": ["Apply minimal changes to resolve issue"],
+            "touched_files": touched_files
+        }
+    
+    def generate_patch(self, state: Dict[str, Any]) -> str:
+        """Generate unified diff patch using deterministic target selection."""
+        import logging
+        from ..logging_setup import log_event
+        logger = logging.getLogger(__name__)
+        
+        fix_plan = state.get("fix_plan", {})
+        current_lot = state.get("current_lot", {})
+        rag_ctx = state.get("rag_ctx", {})
+        
+        if not fix_plan or not current_lot:
             return ""
-        lines: List[str] = []
-        for idx, item in enumerate(issues, start=1):
-            line = getattr(item, "line", None)
-            message = getattr(item, "message", "")
-            rule = getattr(item, "rule", "")
-            key = getattr(item, "key", f"ISSUE-{idx}")
-            lines.append(
-                f"{idx}. ({key}) Linha {line if line is not None else '?'} — {message} ({rule})"
-            )
-        return "\n".join(lines)
-
-    def _resolve_file_path(self, reference: str) -> Optional[Path]:
-        """Resolve file references relative to the configured repo root."""
-        if not reference:
-            return None
-
-        cleaned = reference.strip().replace("\\", "/")
-        if not cleaned:
-            return None
-
-        hints: List[str] = []
-        if ":" in cleaned:
-            _, suffix = cleaned.split(":", 1)
-            suffix = suffix.lstrip("/")
-            if suffix:
-                hints.append(suffix)
-        hints.append(cleaned)
-
-        candidate_paths: List[Path] = []
-        for hint in hints:
-            raw = Path(hint)
-            if raw.is_absolute():
-                candidate_paths.append(raw)
-            candidate_paths.append(self.repo_root / raw)
-            candidate_paths.append(Path.cwd() / raw)
-
-        seen = set()
-        for candidate in candidate_paths:
-            try:
-                resolved = candidate.resolve()
-            except FileNotFoundError:
-                continue
-            if resolved in seen:
-                continue
-            seen.add(resolved)
-            if resolved.exists():
-                return resolved
-
-        roots = self._candidate_roots()
-        for hint in hints:
-            fallback = self._search_by_suffix(roots, Path(hint))
-            if fallback:
-                return fallback
-        return None
-
-    def _candidate_roots(self) -> List[Path]:
-        roots: List[Path] = []
-
-        def register(path: Optional[Union[str, Path]]) -> None:
-            if not path:
-                return
-            resolved = Path(path).expanduser().resolve()
-            if resolved not in roots:
-                roots.append(resolved)
-
-        register(self.repo_root)
-        for parent in self.repo_root.parents:
-            register(parent)
-        register(Path.cwd())
-        env_root = os.getenv("A2A_REPO_ROOT")
-        if env_root:
-            register(env_root)
-        return roots
-
-    def _search_by_suffix(self, roots: Iterable[Path], path_hint: Path) -> Optional[Path]:
-        parts = tuple(part for part in path_hint.parts if part not in {"", "."})
-        if not parts:
-            return None
-        for root in roots:
-            try:
-                for candidate in root.rglob(parts[-1]):
-                    rel_parts = tuple(part for part in candidate.relative_to(root).parts if part not in {"", "."})
-                    if not rel_parts:
-                        continue
-                    if len(parts) <= len(rel_parts) and rel_parts[-len(parts) :] == parts:
-                        return candidate.resolve()
-            except (OSError, RuntimeError) as exc:  # noqa: BLE001
-                LOGGER.debug("Fixer: falha ao buscar %s em %s (%s)", path_hint, root, exc)
-                continue
-        return None
-
-    def _format_diff_path(self, absolute: Path, hint: str) -> str:
-        """Return a path string appropriate for unified diff headers."""
+        
+        # Always select targets[0] (highest priority)
+        targets = fix_plan.get("targets", [])
+        if not targets:
+            logger.warning("No targets in fix_plan")
+            return ""
+        
+        target = targets[0]
+        log_event("fix.select", 
+                 file=target["file"], 
+                 func=target["func_name"], 
+                 from_to=target["from_to"],
+                 reason="highest_priority")
+        
+        issues = current_lot.get("issues", [])
+        rule_key = current_lot.get("ruleKey", "")
+        
+        # Read only the target file (not all issue files)
+        file_contents = {}
+        target_file = target["file"]
+        repo_root = state.get("repo_path", ".")
+        
         try:
-            return absolute.relative_to(self.repo_root).as_posix()
-        except ValueError:
-            if hint:
-                return Path(hint).as_posix()
-            return absolute.as_posix()
-
-    def _clean_code_response(self, response: str) -> str:
-        """Remove code fences and extra text from LLM response."""
-        cleaned = response.strip()
-        if not cleaned:
+            full_path = Path(repo_root) / target_file if not Path(target_file).is_absolute() else Path(target_file)
+            content = full_path.read_text(encoding="utf-8")
+            file_contents[target_file] = content
+            logger.debug(f"Read {len(content)} chars from {target_file}")
+        except Exception as e:
+            logger.error(f"Error reading target file {target_file}: {e}")
             return ""
 
-        # Remove possíveis tokens sentinela devolvidos pelo modelo (ex: <|im_end|]>).
-        cleaned = cleaned.replace("<|im_end|]>", "").strip()
-
-        fence_pattern = re.compile(r"```(?:python|py)?\s*(.*?)```", re.IGNORECASE | re.DOTALL)
-        match = fence_pattern.search(cleaned)
-        code_block = ""
-        if match:
-            code_block = match.group(1).strip()
-            LOGGER.debug("Código extraído de bloco markdown ```python``` com %d chars", len(code_block))
-        else:
-            LOGGER.warning("Nenhum bloco ```python``` encontrado; aplicando heurística de fallback.")
-            if '```' in cleaned:
-                parts = cleaned.split('```')
-                for part in parts:
-                    trimmed = part.strip()
-                    if not trimmed:
-                        continue
-                    if 'import ' in trimmed or 'def ' in trimmed or 'class ' in trimmed:
-                        code_block = trimmed
-                        break
-            if not code_block:
-                code_block = cleaned
-
-        if code_block.lower().startswith("python"):
-            lines = code_block.splitlines()
-            if lines and lines[0].strip().lower() == 'python':
-                code_block = '\n'.join(lines[1:]).strip()
-
-        return code_block.strip()
-
-    def _looks_like_diff_response(self, response: str) -> bool:
-        """Heuristic to detect diff snippets in the LLM output."""
-        if not response:
-            return False
-        diff_pattern = re.compile(r"^(diff --git|--- |\+\+\+ |@@)", re.MULTILINE)
-        match = bool(diff_pattern.search(response))
-        LOGGER.debug("Diff-like response detected=%s", match)
-        return match
-
-    def _has_placeholder_markers(self, content: str) -> bool:
-        """Detect placeholder phrases that indicate the file was truncated."""
-        if not content:
-            return False
-        lowered = content.lower()
-        patterns = [
-            "rest of the functions remain unchanged",
-            "rest of the file remains unchanged",
-            "rest of the code remains unchanged",
-            "omitted for brevity",
-            "remaining code unchanged",
-        ]
-        for marker in patterns:
-            if marker in lowered:
-                return True
-        return False
-
-    def _sanitize_diff_like_response(self, response: str, file_path: str, original: str) -> str:
-        """
-        Corrige respostas onde o LLM retornou um pseudo-diff em vez de código puro.
-        Retorna código Python 'limpo' que pode ser usado para gerar um diff válido.
-        """
-        lines = response.splitlines()
-        LOGGER.debug(
-            "Sanitizing diff-like response for %s: %d raw lines",
-            file_path,
-            len(lines),
-        )
-        clean_lines = []
-        skipped_headers = skipped_code_prefix = skipped_fences = 0
+        
+        # Generate patch prompt for selected target
+        prompt = self._build_patch_prompt_target(target, file_contents, rag_ctx)
+        
+        try:
+            # Prefer function rewriting for complexity rules (S3776)
+            if rule_key == "python:S3776" and target.get("func_name"):
+                func_patch = self._try_function_rewrite_target(target, file_contents, repo_root)
+                if func_patch:
+                    return func_patch
+            
+            # Fallback to diff-based approach
+            patch = self.llm.generate(prompt)
+            
+            # Validate and reconstruct diff
+            sanitized_patch = self._validate_and_reconstruct_diff(patch, target_file)
+            
+            # Enforce allowlist and budget
+            current_lot = state.get("current_lot", {})
+            budget = current_lot.get("budget", 300)
+            error = self._enforce_allowlist_and_budget(sanitized_patch, budget, current_lot)
+            
+            # If diff validation failed or has errors, trigger fallback immediately
+            if not sanitized_patch or error:
+                print(f"Patch validation failed: {error or 'invalid diff'}")
+                return self._fallback_to_rewrite(target, file_contents, rule_key)
+            
+            # Test patch application
+            from ..patcher import SafePatcher
+            patcher = SafePatcher()
+            result = patcher.apply_patch(sanitized_patch, repo_root, budget=budget)
+            
+            if not result["applied"]:
+                print(f"Patch apply failed: {result.get('error', 'unknown')}")
+                return self._fallback_to_rewrite(target, file_contents, rule_key)
+            
+            return sanitized_patch
+                
+        except Exception as e:
+            print(f"Patch generation failed: {e}")
+            return ""
+    
+    def _validate_and_reconstruct_diff(self, text: str, target_file: str) -> str:
+        """Validate and reconstruct diff with proper headers."""
+        t = text.strip()
+        
+        # Remove markdown fences
+        t = re.sub(r"^```[a-zA-Z]*\n|\n```$", "", t, flags=re.M)
+        
+        # Early validation: must have @@ hunks
+        if "@@" not in t:
+            print("Diff validation failed: no hunks found")
+            return ""
+        
+        if not PatchSet:
+            print("Warning: unidiff not available, using raw diff")
+            return t
+        
+        try:
+            # Try to parse as-is first
+            ps = PatchSet(t.splitlines(keepends=True))
+            
+            # Validate at least one valid hunk
+            total_hunks = sum(len(p) for p in ps)
+            if total_hunks == 0:
+                print("Diff validation failed: no valid hunks parsed")
+                return ""
+            
+            # If no git headers, reconstruct them
+            if "diff --git " not in t:
+                rebuilt = []
+                for p in ps:
+                    a = f"a/{p.path}"
+                    b = f"b/{p.path}"
+                    rebuilt.append(f"diff --git {a} {b}\n--- {a}\n+++ {b}\n")
+                    for h in p:
+                        rebuilt.append(str(h))
+                t = "".join(rebuilt) if rebuilt else t
+            
+            # Final validation
+            PatchSet(t.splitlines(keepends=True))
+            return t
+            
+        except Exception as e:
+            print(f"Diff validation failed: {e}")
+            return ""  # Return empty to trigger fallback
+    
+    def _enforce_allowlist_and_budget(self, patch_diff: str, budget: int = None, current_lot: dict = None) -> str:
+        """Enforce allowlist and budget constraints."""
+        if not PatchSet or not patch_diff:
+            return ""
+        
+        try:
+            ps = PatchSet(patch_diff.splitlines(keepends=True))
+            touched = {p.path for p in ps}
+            
+            # Check allowlist
+            allowed_prefixes = ("src/", "tests/", "tests_prop/")
+            if not all(p.startswith(allowed_prefixes) for p in touched):
+                return f"patch touches disallowed paths: {touched}"
+            
+            # Check lot-specific files
+            if current_lot:
+                issue_paths = set()
+                for issue in current_lot.get("issues", []):
+                    component = issue.get("component", "")
+                    if ":" in component:
+                        path = component.split(":", 1)[1]
+                    else:
+                        path = component
+                    if path:
+                        issue_paths.add(path)
+                
+                if issue_paths and not touched.issubset(issue_paths):
+                    return f"patch touches files outside current lot: {touched - issue_paths}"
+            
+            # Check budget if provided
+            if budget is not None:
+                loc_changed = sum(h.added + h.removed for p in ps for h in p)
+                if loc_changed > budget:
+                    return f"LOC budget exceeded ({loc_changed}>{budget})"
+            
+            return ""  # No errors
+        except Exception as e:
+            return f"Patch validation failed: {e}"
+    
+    def _fallback_codemod(self, file_path: str, rule_key: str) -> str:
+        """Apply mechanical refactoring for common patterns."""
+        if not Path(file_path).exists():
+            return ""
+        
+        try:
+            with open(file_path, 'r') as f:
+                original = f.read()
+            
+            modified = original
+            
+            # S106: Replace print() with logger
+            if rule_key == "python:S106":
+                modified = self._fix_print_statements(modified)
+            
+            # File not closed: wrap with context manager
+            elif "file" in rule_key.lower() and "close" in rule_key.lower():
+                modified = self._fix_file_handling(modified)
+            
+            # S3776: Complexity - flatten if pyramids
+            elif rule_key == "python:S3776":
+                modified = self._fix_complexity_s3776(modified)
+            
+            if modified != original:
+                # Generate unified diff
+                import difflib
+                diff_lines = list(difflib.unified_diff(
+                    original.splitlines(keepends=True),
+                    modified.splitlines(keepends=True),
+                    fromfile=f"a/{file_path}",
+                    tofile=f"b/{file_path}"
+                ))
+                return "".join(diff_lines)
+            
+        except Exception as e:
+            print(f"Codemod fallback failed: {e}")
+        
+        return ""
+    
+    def _fix_print_statements(self, code: str) -> str:
+        """Replace print() with logger calls."""
+        if cst is None:
+            # Simple regex fallback
+            if "import logging" not in code:
+                code = "import logging\n" + code
+            if "logger = logging.getLogger(__name__)" not in code:
+                # Insert after imports
+                lines = code.split('\n')
+                insert_idx = 0
+                for i, line in enumerate(lines):
+                    if line.startswith('import ') or line.startswith('from '):
+                        insert_idx = i + 1
+                lines.insert(insert_idx, "logger = logging.getLogger(__name__)")
+                code = '\n'.join(lines)
+            
+            # Replace print calls
+            code = re.sub(r'print\(([^)]+)\)', r'logger.info(\1)', code)
+            return code
+        
+        # Use libcst for more robust transformation
+        try:
+            tree = cst.parse_module(code)
+            transformer = PrintToLoggerTransformer()
+            modified_tree = tree.visit(transformer)
+            return modified_tree.code
+        except:
+            return code
+    
+    def _fix_file_handling(self, code: str) -> str:
+        """Wrap file operations with context managers."""
+        # Simple pattern matching for open() calls
+        pattern = r'(\w+)\s*=\s*open\(([^)]+)\)'
+        
+        def replace_open(match):
+            var_name = match.group(1)
+            args = match.group(2)
+            return f"with open({args}) as {var_name}:"
+        
+        return re.sub(pattern, replace_open, code)
+    
+    def _fix_complexity_s3776(self, code: str) -> str:
+        """Flatten complex if pyramids with guard clauses."""
+        lines = code.split('\n')
+        result = []
+        
         for line in lines:
-            # remove headers típicos de diff
+            # Simple heuristic: convert nested ifs to guard clauses
             stripped = line.strip()
-            if re.match(r"^(diff|---|\+\+\+|@@)", stripped):
-                skipped_headers += 1
-                continue
-            # remove prefixos incorretos como '+python'
-            if stripped.startswith("+python"):
-                skipped_code_prefix += 1
-                continue
-            # remove cercas de código
-            if stripped.startswith("```"):
-                skipped_fences += 1
-                continue
-            clean_lines.append(line + "\n")
-
-        cleaned = "".join(clean_lines).strip()
-        LOGGER.debug(
-            "Sanitize diff-like response kept %d lines (headers=%d, +python=%d, fences=%d)",
-            len(clean_lines),
-            skipped_headers,
-            skipped_code_prefix,
-            skipped_fences,
-        )
-        if not cleaned or cleaned == original.strip():
-            LOGGER.warning("Sanitize produced no new code; fallback to original content.")
-            return original
-        return cleaned
-
-    def _blocked_definition_removals(
-        self,
-        missing_defs: List[str],
-        issues: List,
-        context: str,
-    ) -> List[str]:
-        """Return the subset of missing definitions that cannot be removed."""
-        if not missing_defs:
-            return []
-
-        text_sources: List[str] = []
-        for item in issues:
-            message = getattr(item, "message", "")
-            if message:
-                text_sources.append(message)
-            rule = getattr(item, "rule", "")
-            if rule:
-                text_sources.append(rule)
-        if context:
-            text_sources.append(context)
-
-        blocked: List[str] = []
-        for name in missing_defs:
-            if not self._removal_requested_for(name, text_sources):
-                blocked.append(name)
-        return blocked
-
-    def _removal_requested_for(self, definition_name: str, sources: Iterable[str]) -> bool:
-        """Return True when any source explicitly requests removing `definition_name`."""
-        if not definition_name:
-            return False
-        normalized_targets = {definition_name.lower()}
-        if "_" in definition_name:
-            normalized_targets.add(definition_name.replace("_", " ").lower())
-            normalized_targets.add(definition_name.replace("_", "").lower())
-
-        for raw in sources:
-            text = (raw or "").lower()
-            if not text:
-                continue
-            if not REMOVAL_KEYWORD_PATTERN.search(text):
-                continue
-            if any(target in text for target in normalized_targets):
-                return True
-        return False
-
-    def _collect_top_level_defs(self, source: str) -> set[str]:
-        """Collect names of top-level functions and classes."""
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return set()
-        names: set[str] = set()
-        for node in tree.body:
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(node.name)
-        return names
-
-    def _is_valid_python_code(self, code: str) -> tuple[bool, str | None]:
-        """Return whether code is valid Python and, if not, the syntax error."""
-        if not code.strip():
-            return False, "resposta vazia"
-        try:
-            ast.parse(code)
-            return True, None
-        except SyntaxError as exc:
-            message = f"{exc.msg} (linha {exc.lineno}, coluna {exc.offset})"
-            LOGGER.debug("SyntaxError while parsing fixer output: %s", message)
-            return False, message
-
-    def _generate_patch(self, original: str, fixed: str, file_path: str) -> str:
-        """Generate unified diff patch leveraging GitPython when available."""
-        LOGGER.debug(
-            "Generating patch for %s: original=%d chars fixed=%d chars",
-            file_path,
-            len(original),
-            len(fixed),
-        )
-        if not fixed.strip() or fixed.strip() == original.strip():
-            LOGGER.warning("Fixer produced identical content or empty fix.")
+            if stripped.startswith('if ') and line.count('    ') > 1:
+                # Convert to guard clause
+                condition = stripped[3:].rstrip(':')
+                indent = '    ' * (line.count('    ') - 1)
+                result.append(f"{indent}if not ({condition}):")
+                result.append(f"{indent}    return")
+            else:
+                result.append(line)
+        
+        return '\n'.join(result)
+    
+    def _fallback_to_rewrite(self, target: dict, file_contents: dict, rule_key: str) -> str:
+        """Fallback to function/file rewriting when diff fails."""
+        print("Falling back to function/file rewrite...")
+        
+        # Try function rewrite first
+        if target.get("func_name") and target.get("func_span"):
+            func_patch = self._try_function_rewrite_target(target, file_contents, "")
+            if func_patch:
+                print("Function rewrite successful")
+                return func_patch
+        # Para S3776 (complexidade), evite reescrever arquivo inteiro; use codemod mecânico
+        if rule_key == "python:S3776":
+            fallback_patch = self._fallback_codemod(target["file"], rule_key)
+            if fallback_patch:
+                print(f"Using fallback codemod for {rule_key}")
+                return fallback_patch
+            # Para S3776, não faça full file rewrite
             return ""
 
+        # Try full file rewrite (outras regras)
+        full_req = self._build_full_file_prompt_target(target, file_contents)
+        new_texts = self.llm.generate(full_req)
+        rebuilt_diff = self._make_diff_from_texts(file_contents, new_texts)
+        
+        if rebuilt_diff:
+            print("Full file rewrite successful")
+            return rebuilt_diff
+        
+        # Last resort: mechanical codemod
+        fallback_patch = self._fallback_codemod(target["file"], rule_key)
+        if fallback_patch:
+            print(f"Using fallback codemod for {rule_key}")
+            return fallback_patch
+        
+        return ""
+    
+    def _component_rel(self, c: str) -> str:
+        """Extract relative path from component."""
+        return c.split(":", 1)[-1] if ":" in c else c
+    
+    def _find_enclosing_function(self, text: str, line_no: int) -> tuple[str, int, int] | None:
+        """Find function enclosing the given line number."""
         try:
-            return self._generate_patch_with_gitpython(original, fixed, file_path)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning(
-                "GitPython falhou ao gerar diff para %s: %s. Recuando para difflib.",
-                file_path,
-                exc,
-            )
-            return self._generate_patch_with_difflib(original, fixed, file_path)
-
-    def _generate_patch_with_gitpython(self, original: str, fixed: str, file_path: str) -> str:
-        """Use GitPython (git diff --no-index) to produce a unified diff."""
+            tree = ast.parse(text)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    s = getattr(node, "lineno", None)
+                    e = getattr(node, "end_lineno", None)
+                    if s and e and s <= line_no <= e:
+                        return node.name, s-1, e  # (name, start 0-based, end)
+        except:
+            pass
+        return None
+    
+    def _find_best_func_by_line(self, text: str, line_no: int):
+        """Find closest function when line doesn't fall within any function."""
         try:
-            from git import Git  # lazy import to keep optional dependency
-        except ImportError as exc:  # pragma: no cover - handled by fallback
-            raise RuntimeError("GitPython não disponível") from exc
-
-        target_path = Path(file_path)
-        normalized_path = target_path.as_posix()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_root = Path(tmpdir)
-            original_rel = Path("orig") / target_path
-            fixed_rel = Path("new") / target_path
-            original_path = tmp_root / original_rel
-            fixed_path = tmp_root / fixed_rel
-            original_path.parent.mkdir(parents=True, exist_ok=True)
-            fixed_path.parent.mkdir(parents=True, exist_ok=True)
-            original_path.write_text(original, encoding="utf-8")
-            fixed_path.write_text(fixed, encoding="utf-8")
-
-            git_cli = Git(str(tmp_root))
-            cmd = [
-                "git",
-                "--no-pager",
-                "diff",
-                "--no-index",
-                "--text",
-                "--no-ext-diff",
-                "--color=never",
-                "--unified=3",
-                "--",
-                original_rel.as_posix(),
-                fixed_rel.as_posix(),
-            ]
-            status, stdout, stderr = git_cli.execute(
-                cmd,
-                with_extended_output=True,
-                with_exceptions=False,
-            )
-
-        status = int(str(status).strip())
-        if status not in (0, 1):
-            stderr_text = (stderr or "").strip()
-            raise RuntimeError(
-                f"git diff retornou status {status} ao gerar patch: {stderr_text or 'erro desconhecido'}"
-            )
-
-        diff_output = stdout or ""
-        if not diff_output.strip():
-            LOGGER.debug("git diff não encontrou mudanças entre snapshots para %s", file_path)
-            return ""
-
-        normalized_diff = diff_output.replace(
-            f"a/{original_rel.as_posix()}",
-            f"a/{normalized_path}",
-        ).replace(
-            f"b/{fixed_rel.as_posix()}",
-            f"b/{normalized_path}",
-        )
-        if not normalized_diff.endswith("\n"):
-            normalized_diff += "\n"
-        LOGGER.debug(
-            "GitPython generated diff for %s totals %d chars",
-            file_path,
-            len(normalized_diff),
-        )
-        return normalized_diff
-
-    def _generate_patch_with_difflib(self, original: str, fixed: str, file_path: str) -> str:
-        """Fallback unified diff generation using difflib."""
-        original_lines = original.splitlines(keepends=True)
-        fixed_lines = fixed.splitlines(keepends=True)
-
-        diff_lines = list(
-            difflib.unified_diff(
-                original_lines,
-                fixed_lines,
-                fromfile=f"a/{file_path}",
-                tofile=f"b/{file_path}",
-                lineterm="\n",
-            )
-        )
-
-        if not diff_lines:
-            LOGGER.error("Unified diff generation (difflib) returned empty output.")
-            return ""
-
-        header = f"diff --git a/{file_path} b/{file_path}\n"
-        diff_text = "".join(diff_lines)
-        if not diff_text.endswith("\n"):
-            diff_text += "\n"
-        full_diff = header + diff_text
-        LOGGER.debug(
-            "difflib generated diff for %s totals %d chars",
-            file_path,
-            len(full_diff),
-        )
-        return full_diff
-
-    def _parse_changes_response(self, response: str) -> List[dict]:
-        """Parse the changes format response from LLM."""
-        changes = []
-        
-        # Clean up response first
-        cleaned_response = self._clean_llm_response(response)
-        LOGGER.debug("Cleaned response preview: %s", cleaned_response[:200])
-        
-        # Try to find ```changes blocks first
-        changes_pattern = re.compile(r'```changes\s*(.*?)```', re.DOTALL | re.IGNORECASE)
-        matches = changes_pattern.findall(cleaned_response)
-        
-        # If no ```changes blocks, try to parse direct ORIGINAL/FIXED format
-        if not matches:
-            LOGGER.debug("No ```changes``` blocks found, trying direct ORIGINAL/FIXED parsing")
-            matches = [cleaned_response]  # Treat entire response as one block
-        
-        for match in matches:
-            # Look for ORIGINAL: section with ```python block
-            original_pattern = r'ORIGINAL:\s*```python\s*(.*?)```'
-            original_match = re.search(original_pattern, match, re.DOTALL | re.IGNORECASE)
+            tree = ast.parse(text)
+            candidates = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef):
+                    s = getattr(node, "lineno", None)
+                    e = getattr(node, "end_lineno", None)
+                    if s and e:
+                        dist = 0 if (s <= line_no <= e) else min(abs(line_no-s), abs(line_no-e))
+                        candidates.append((dist, node.name, s-1, e))
+            return min(candidates)[1:] if candidates else None
+        except:
+            return None
+    
+    def _parse_from_to(self, msg: str) -> tuple[int, int] | None:
+        """Parse complexity reduction target from message."""
+        m = re.search(r'from\s+(\d+)\s+to\s+(?:the\s+)?(\d+)', msg, re.I)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        return None
+    
+    def _build_fix_goals(self, repo_root: str, lot: dict) -> list[dict]:
+        """Build detailed fix goals from issues."""
+        goals = []
+        for iss in lot.get("issues", []):
+            rel = self._component_rel(iss.get("component", ""))
+            path = Path(repo_root) / rel
+            if not path.exists():
+                continue
             
-            # Look for FIXED: section with ```python block  
-            fixed_pattern = r'FIXED:\s*```python\s*(.*?)```'
-            fixed_match = re.search(fixed_pattern, match, re.DOTALL | re.IGNORECASE)
-            
-            if not original_match or not fixed_match:
-                LOGGER.warning("Could not find ORIGINAL and FIXED sections with ```python blocks")
-                LOGGER.debug("Match content: %s", match[:500])
-                # Try to extract just the code from ```python blocks as fallback
-                return self._parse_full_code_response(cleaned_response)
-            
-            original_code = original_match.group(1).strip()
-            fixed_code = fixed_match.group(1).strip()
-            
-            if original_code and fixed_code:
-                changes.append({
-                    "original": original_code,
-                    "fixed": fixed_code
+            try:
+                text = path.read_text(encoding="utf-8")
+                line = iss.get("textRange", {}).get("startLine") or iss.get("line")
+                
+                func = None
+                if line:
+                    func = self._find_enclosing_function(text, int(line))
+                    if not func:
+                        func = self._find_best_func_by_line(text, int(line))
+                
+                frm_to = self._parse_from_to(iss.get("message", ""))
+                
+                goals.append({
+                    "rule": iss.get("rule", ""),
+                    "file": rel,
+                    "func_name": func[0] if func else None,
+                    "func_span": [func[1], func[2]] if func else None,
+                    "from_to": frm_to or [None, 15],
+                    "severity": iss.get("severity", "")
                 })
-                LOGGER.debug("Parsed change: %d chars original -> %d chars fixed", 
-                           len(original_code), len(fixed_code))
+            except Exception as e:
+                print(f"Error processing issue in {rel}: {e}")
+                continue
         
-        return changes
+        # Sort by severity first, then by complexity gap (highest first)
+        SEV_W = {"BLOCKER": 0, "CRITICAL": 1, "MAJOR": 2, "MINOR": 3, "INFO": 4}
+        
+        def gap(t):
+            f, to = t.get("from_to") or (None, 15)
+            return (f or 0) - (to or 15)
+        
+        goals.sort(key=lambda t: (SEV_W.get(t.get("severity"), 9), -gap(t)))
+        return goals
     
-    def _clean_llm_response(self, response: str) -> str:
-        """Clean up LLM response by removing unwanted tokens and unescaping HTML."""
-        # Remove end tokens - handle both escaped and unescaped versions
-        cleaned = re.sub(r'<\|im_end\|\]>', '', response)
-        cleaned = re.sub(r'&lt;\|im_end\|\]&gt;', '', cleaned)
-        
-        # Unescape HTML entities
-        cleaned = cleaned.replace('&quot;', '"').replace('&gt;', '>').replace('&lt;', '<').replace('&amp;', '&')
-        
-        return cleaned.strip()
+    def _window_lines(self, text: str, start: int, end: int, k: int = 10) -> str:
+        """Extract window of lines around function."""
+        lines = text.splitlines(True)
+        a = max(0, start - k)
+        b = min(len(lines), end + k)
+        return "".join(lines[a:b])
     
-    def _parse_full_code_response(self, response: str) -> List[dict]:
-        """Parse response that contains full fixed code instead of changes format."""
-        LOGGER.debug("Trying to parse full code response")
-        
-        # Extract code from ```python blocks
-        code_block = self._clean_code_response(response)
-        if not code_block:
-            LOGGER.error("No code block found in response")
-            return []
-        
-        # Return as a single "change" that replaces entire content
-        return [{
-            "original": "FULL_FILE_REPLACEMENT",  # Special marker
-            "fixed": code_block
-        }]
+    def _make_unified_diff(self, rel_path: str, before: str, after: str, ctx: int = 3) -> str:
+        """Generate unified diff with git headers."""
+        diff_lines = list(difflib.unified_diff(
+            before.splitlines(True), after.splitlines(True),
+            fromfile=f"a/{rel_path}", tofile=f"b/{rel_path}",
+            n=ctx, lineterm=""
+        ))
+        if diff_lines:
+            return f"diff --git a/{rel_path} b/{rel_path}\n" + "\n".join(diff_lines)
+        return ""
     
-    def _apply_changes_to_content(self, original_content: str, changes: List[dict]) -> str:
-        """Apply the parsed changes to the original content."""
-        if not changes:
+    def _merge_func(self, text: str, start: int, end: int, new_func_src: str) -> str:
+        """Merge new function source into original text."""
+        if not new_func_src.endswith("\n"):
+            new_func_src += "\n"
+        lines = text.splitlines(True)
+        return "".join(lines[:start]) + new_func_src + "".join(lines[end:])
+    
+    def _prompt_rewrite_func(self, rule_key: str, func_name: str, ctx_text: str, func_src: str) -> str:
+        """Build prompt for function rewriting."""
+        return f"""You are a Python refactoring expert. Sonar rule: {rule_key}.
+Reduce cognitive complexity of {func_name} without changing public behavior.
+
+Context (read-only):
+<<CTX>>
+{ctx_text}
+<<END_CTX>>
+
+Original function:
+<<FUNC_ORIG>>
+{func_src}
+<<END_FUNC_ORIG>>
+
+Instructions:
+- Same signature and contracts
+- Prefer guard-clauses and small local helpers
+- Do not modify other functions
+- Respond ONLY with the complete function body starting with def {func_name}(...):. Do not include comments, markdown/backticks, or any text outside the code.
+- Wrap your response between <<FUNC_NEW>> and <<END_FUNC>> markers.
+
+<<FUNC_NEW>>
+def {func_name}""".rstrip()
+    
+    def _try_function_rewrite_target(self, target: dict, file_contents: dict, repo_root: str) -> str:
+        """Try function-level rewriting for single target."""
+        if not target.get("func_name") or not target.get("func_span"):
             return ""
         
-        # Handle full file replacement
-        if len(changes) == 1 and changes[0]["original"] == "FULL_FILE_REPLACEMENT":
-            LOGGER.debug("Applying full file replacement")
-            return changes[0]["fixed"]
+        file_path = target["file"]
+        func_name = target["func_name"]
+        start, end = target["func_span"]
         
-        result = original_content
+        if file_path not in file_contents:
+            return ""
         
-        for change in changes:
-            original_code = change["original"]
-            fixed_code = change["fixed"]
-            
-            if original_code not in result:
-                LOGGER.warning("Original code not found in file content")
-                # Try fuzzy matching
-                result = self._fuzzy_replace(result, original_code, fixed_code)
-                if result == original_content:  # No change was made
-                    LOGGER.error("Failed to apply change - original code not found")
-                    return ""
-                continue
-            
-            # Replace the original code with fixed code
-            result = result.replace(original_code, fixed_code, 1)
-            LOGGER.debug("Applied change: replaced %d chars with %d chars", 
-                        len(original_code), len(fixed_code))
-        
-        return result
-
-    def _fuzzy_replace(self, content: str, original: str, fixed: str) -> str:
-        """Try to find and replace code with fuzzy matching."""
-        # Remove leading/trailing whitespace and normalize
-        original_lines = [line.strip() for line in original.splitlines() if line.strip()]
-        content_lines = content.splitlines()
-        
-        # Try to find a sequence of lines that match
-        for i in range(len(content_lines) - len(original_lines) + 1):
-            match_lines = [content_lines[i + j].strip() for j in range(len(original_lines))]
-            
-            if match_lines == original_lines:
-                # Found a match, replace the lines
-                new_lines = content_lines[:i] + fixed.splitlines() + content_lines[i + len(original_lines):]
-                return "\n".join(new_lines)
-        
-        return content  # Return original if no match found
-
-    def _patch_applies(self, patch: str) -> tuple[bool, Optional[str]]:
-        """Run git apply --check to verify patch validity without modifying files."""
-        if not patch.strip():
-            return False, "patch vazio"
-        tmp_path = None
         try:
-            with tempfile.NamedTemporaryFile("w", delete=False, suffix=".patch") as handle:
-                handle.write(patch)
-                tmp_path = Path(handle.name)
-            result = subprocess.run(
-                ["git", "apply", "--check", str(tmp_path)],
-                cwd=str(self.repo_root),
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode == 0:
-                return True, None
-            combined = (result.stdout or "") + (result.stderr or "")
-            return False, combined.strip() or "git apply --check retornou código não zero"
-        finally:
-            if tmp_path and tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    LOGGER.debug("Não foi possível remover arquivo temporário %s", tmp_path)
+            text = file_contents[file_path]
+            
+            # Extract function and context
+            ctx_text = self._window_lines(text, start, end, k=5)
+            lines = text.splitlines(True)
+            func_src = "".join(lines[start:end])
+            
+            # Build prompt for function rewrite
+            prompt = self._prompt_rewrite_func(target["rule"], func_name, ctx_text, func_src)
+            
+            # Generate new function
+            resp = self.llm.generate(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=600,
+                stop=["<<END_FUNC>>"]
+            ).strip()
+            
+            # Extract function using robust helper
+            try:
+                new_func = _extract_func_from_llm(resp, func_name)
+            except ValueError as e:
+                print(f"Function extraction failed: {e}")
+                return ""
+            
+            # Merge and create diff locally
+            new_file = self._merge_func(text, start, end, new_func)
+            patch = build_unified_diff(file_path, text, new_file)
+            
+            # Validate diff before returning
+            ok, why = validate_diff(patch)
+            if not ok:
+                print(f"Generated diff validation failed: {why}")
+                return ""
+            
+            if patch:
+                print(f"Generated function-level patch for {func_name}")
+                return patch
+                
+        except Exception as e:
+            print(f"Function rewrite failed for {func_name}: {e}")
+        
+        return ""
+    
+    def _build_full_file_prompt_target(self, target: dict, file_contents: dict) -> str:
+        """Build prompt for full file rewrite of target file."""
+        file_path = target["file"]
+        content = file_contents.get(file_path, "")
+        rule_key = target["rule"]
+        func_name = target.get("func_name", "unknown")
+        
+        return f"""Rewrite the complete file to fix Sonar rule {rule_key} in function {func_name}.
+
+Current file:
+=== {file_path} ===
+{content}
+
+Return the complete rewritten file content.
+Format: === {file_path} === followed by complete file content.
+Make minimal changes focused on the specific function.
+
+Rewritten file:"""
+    
+    def _make_diff_from_texts(self, original_contents: dict, new_text: str) -> str:
+        """Generate unified diff from original and new file contents."""
+        import difflib
+        import re
+        
+        # Parse new_text for file sections
+        sections = re.split(r'=== ([^=]+) ===', new_text)
+        if len(sections) < 3:
+            return ""
+        
+        diffs = []
+        for i in range(1, len(sections), 2):
+            if i + 1 >= len(sections):
+                break
+            
+            filename = sections[i].strip()
+            new_content = sections[i + 1].strip()
+            
+            if filename in original_contents:
+                original_lines = original_contents[filename].splitlines(keepends=True)
+                new_lines = new_content.splitlines(keepends=True)
+                
+                diff = list(difflib.unified_diff(
+                    original_lines,
+                    new_lines,
+                    fromfile=f"a/{filename}",
+                    tofile=f"b/{filename}",
+                    n=3  # 3 lines of context
+                ))
+                
+                if diff:
+                    diffs.extend(diff)
+        
+        return "".join(diffs)
+    
+
+    
+    def _build_patch_prompt_target(self, target: dict, file_contents: dict, rag_ctx: dict) -> str:
+        """Build prompt for patch generation focused on single target."""
+        few_shots = rag_ctx.get("few_shots", [])
+        contexts = rag_ctx.get("contexts", [])
+        
+        # Prioritize few_shots, fallback to contexts
+        examples = "\n\n".join(few_shots[:3]) if few_shots else "\n".join(contexts[:2])
+        
+        file_path = target["file"]
+        content = file_contents.get(file_path, "")
+        
+        # Limit content size for prompt
+        if len(content) > 2000:
+            content = content[:2000] + "\n... (truncated)"
+        
+        rule_key = target["rule"]
+        func_name = target.get("func_name", "unknown")
+        from_to = target.get("from_to", [None, 15])
+        
+        target_info = f"Focus on function {func_name} in {file_path}"
+        if from_to[0] is not None:
+            target_info += f" (reduce complexity from {from_to[0]} to {from_to[1]})"
+        
+        return f"""Generate a minimal unified diff to fix Sonar rule {rule_key}.
+
+{target_info}
+
+Current file:
+--- {file_path} ---
+{content}
+
+Fix examples and patterns:
+{examples}
+
+IMPORTANT REQUIREMENTS:
+- Generate ONLY unified diff format (--- +++ @@ lines)
+- Include ≥3 lines of unchanged context before and after each change
+- Do not create hunks that start at line 1 (avoid @@ -1,3)
+- Make minimal changes focused on the specific function
+- Focus on code quality improvements
+
+Diff:"""

@@ -1,45 +1,76 @@
 # AutoFix SonarQube + A2A + Property-Based Testing
 
-Pipeline ponta-a-ponta inspirado no framework PGS (Property-Guided Synthesis) que integra SonarQube, agentes LLM orquestrados via protocolo Agent2Agent (A2A) e testes baseados em propriedades (Hypothesis) para gerar correções automáticas.
+Pipeline ponta-a-ponta inspirado no framework PGS (Property-Guided Synthesis) que integra SonarQube, agentes LLM orquestrados via LangGraph e testes baseados em propriedades (Hypothesis) para gerar correções automáticas.
 
-## Visão Geral
+## Nova Arquitetura
 
-1. Executa `sonar-scanner` para análise estática inicial.
-2. Coleta issues do projeto no SonarQube.
-3. Para cada issue é criada uma sessão A2A/LangGraph:
-   - **Property Agent** seleciona o arquivo afetado e orienta a geração de propriedades Hypothesis.
-   - **Tester Agent (modo propriedades)** gera e executa apenas os testes de propriedades; se falhar, a pipeline encerra antes do Requester.
-   - **Requester Agent** monta o contexto com código, issue e feedback acumulado.
-   - **Fixer Agent** propõe um patch (diff) e o aplica via `git apply`.
-   - **Tester Agent** roda `pytest` + propriedades geradas e converte os logs em feedback semântico.
-   - **Sonar Agent** reexecuta o `sonar-scanner` para validar a correção.
-   - **PR Agent** cria branch, commit e Pull Request se tudo passar.
-   - Caso qualquer etapa falhe, o contexto é enriquecido com o feedback e o loop continua até `MAX_ROUNDS`.
+Esta versão refatorada implementa:
+
+- **Orquestração LangGraph**: Grafo de estados com nós especializados
+- **RAG Local**: ChromaDB + sentence-transformers para contexto
+- **Property-First**: Testes Hypothesis gerados ANTES de modificar código
+- **Cobertura Integrada**: coverage.xml importado pelo SonarQube
+- **Patches Seguros**: Allowlist de paths e validação de diffs
+- **Loops de Refinamento**: Até MAX_ROUNDS para correção iterativa
+
+## Fluxo da Pipeline
+
+```
+SONAR_INGEST → PLAN → RULE_RAG → PROP_SPEC → PROP_GEN → PROP_RUN
+                                                                    ↓
+PR_BUILDER ← LOT_GATE ← SONAR_RESCAN ← TESTS ← PATCH ← FIX_PLAN
+```
+
+### Etapas Principais
+
+1. **SONAR_INGEST**: Coleta issues via API REST
+2. **PLAN**: Agrupa issues em lotes (regra × diretório)
+3. **RULE_RAG**: Busca contexto e exemplos de correção
+4. **PROP_SPEC/PROP_GEN**: Gera testes Hypothesis **antes** de tocar no código
+5. **PROP_RUN**: Executa propriedades, captura contraexemplos
+6. **FIX_PLAN**: Planeja correção mínima baseada em contraexemplos
+7. **PATCH**: Aplica diff unificado com validação de paths
+8. **TESTS**: Executa suite completa + gera coverage.xml
+9. **SONAR_RESCAN**: Re-executa scanner, valida Quality Gate
+10. **LOT_GATE**: Decide continuar, próximo lote ou finalizar
+11. **PR_BUILDER**: Cria Pull Request se lote aprovado
+
+### Loops de Refinamento
+
+- **Propriedade falha** → FIX_PLAN com contraexemplos
+- **Teste quebra** → FIX_PLAN com trace de erro  
+- **Sonar reprova** → RULE_RAG com contexto expandido
+- **Max rounds** → Pula para próximo lote
 
 ## Estrutura
 
 ```
 .
 ├─ app/
-│  ├─ main.py                 # Orquestrador (LangGraph + A2A)
+│  ├─ main.py                 # Orquestrador LangGraph
 │  ├─ sonarqube_client.py     # Cliente REST SonarQube
-│  ├─ patcher.py              # Aplicação de patches via git
-│  ├─ utils.py                # sonar-scanner, git, PR helpers
-│  ├─ llm_client.py           # Abstração para OpenAI ou LLM local (llama.cpp)
+│  ├─ patcher.py              # Aplicação segura de patches
+│  ├─ utils.py                # Utilitários (scanner, git, masking)
+│  ├─ llm_client.py           # Abstração LLM (OpenAI/local)
+│  ├─ rag/
+│  │  ├─ ingest.py            # Indexação ChromaDB
+│  │  └─ retriever.py         # Retrieval híbrido
 │  └─ a2a/
-│     ├─ protocol.py          # Estruturas de estado e tipos
-│     ├─ property_agent.py    # Seleciona componentes e inicia propriedades
-│     ├─ requester_agent.py   # Gera contexto para o Fixer
-│     ├─ fixer_agent.py       # Gera patch em diff unificado
-│     └─ tester_agent.py      # Pytest/Hypothesis + resumo LLM
-├─ src/
-│  ├─ __init__.py
-│  └─ sample_module.py        # Código exemplo para testes de propriedades
-├─ tests/
-│  ├─ conftest.py             # Configuração Hypothesis e sys.path
-│  └─ test_properties.py      # Testes baseados em propriedades
+│     ├─ protocol.py          # AgentState e tipos
+│     ├─ property_agent.py    # PROP_SPEC/PROP_GEN
+│     ├─ tester_agent.py      # PROP_RUN/TESTS + coverage
+│     ├─ fixer_agent.py       # FIX_PLAN/PATCH
+│     └─ requester_agent.py   # Contexto (legacy)
+├─ src/                        # Código fonte do projeto
+├─ tests/                      # Testes convencionais
+│  ├─ conftest.py             # Config Hypothesis + reports/
+│  └─ test_pipeline_smoke.py  # Smoke tests
+├─ tests_prop/                 # Testes de propriedades (gerados)
+├─ reports/                    # JUnit XML, cobertura
+├─ chroma_db/                  # Base vetorial local
+├─ .coveragerc                 # Config de cobertura
+├─ sonar-project.properties    # Config Sonar + coverage.xml
 ├─ .github/workflows/autofix.yml
-├─ sonar-project.properties
 ├─ .env.example
 └─ README.md
 ```
@@ -64,18 +95,63 @@ cp .env.example .env  # e preencha os valores
 
 ## Execução Local
 
-1. Suba o SonarQube (ex.: `docker run -d -p 9000:9000 sonarqube:community`).
-2. Configure tokens/variáveis (`SONARQUBE_URL`, `SONARQUBE_TOKEN`, `OPENAI_API_KEY` ou `LLM_LOCAL_MODEL_PATH`, `SONAR_PROJECT_KEY`).
-   - Para apontar a pipeline a um código hospedado fora de `tcc-pipeline`, defina `AUTOFIX_TARGET_ROOT` com o caminho absoluto do projeto (ex.: `AUTOFIX_TARGET_ROOT=/caminho/para/src/test-pipeline`). Esse valor é usado pelos agentes Fixer/Tester/Executor/Sonar e também pelo gerenciador de PRs.
-3. Rode uma análise inicial: `sonar-scanner`.
-4. Execute o pipeline:
+### 1. Setup do Ambiente
 
 ```bash
+# Clone e configure
+git clone <repo>
 cd tcc-pipeline
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+# .venv\Scripts\activate  # Windows
+
+# Instale dependências
+pip install -r requirements.txt
+
+# Configure variáveis
+cp .env.example .env
+# Edite .env com seus tokens
+```
+
+### 2. SonarQube
+
+```bash
+# Suba SonarQube local
+docker run -d -p 9000:9000 sonarqube:community
+
+# Ou use instância existente
+# Configure SONARQUBE_URL e SONARQUBE_TOKEN no .env
+```
+
+### 3. Indexação RAG (Opcional)
+
+```bash
+# Indexe o código para contexto
+python -c "
+from app.rag.ingest import RAGIngestor
+from pathlib import Path
+ingestor = RAGIngestor()
+result = ingestor.ingest_directory(Path('.'))
+print(f'Indexed {result[\"docs_indexed\"]} documents')
+"
+```
+
+### 4. Execute a Pipeline
+
+```bash
+# Gere cobertura inicial (opcional)
+pytest --cov=src --cov-report=xml:coverage.xml
+
+# Execute o AutoFix
 python -m app.main
 ```
 
-A sessão A2A gera correções, valida com `pytest` + Hypothesis, reexecuta o Sonar e opcionalmente cria um Pull Request.
+### 5. Resultados
+
+- **Propriedades**: `tests_prop/test_*_props.py`
+- **Relatórios**: `reports/junit*.xml`
+- **Cobertura**: `coverage.xml`
+- **PRs**: Links exibidos no final
 
 > Nota: o pipeline usa LangGraph para orquestrar os agentes e o parâmetro `LLM_PROVIDER` permite escolher entre OpenAI (`LLM_PROVIDER=openai`) ou um modelo local via `llama-cpp-python` (`LLM_PROVIDER=local`).
 

@@ -1,106 +1,54 @@
-"""Common data structures for A2A agent communication."""
+"""Agent2Agent protocol definitions and state management."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, TypedDict
+from pydantic import BaseModel, Field
+from typing import Any, Dict, List, Optional
 
 
-@dataclass
-class Issue:
-    key: str
-    rule: str
-    severity: str
-    component: str
-    message: str
-    line: Optional[int]
+class AgentState(BaseModel):
+    """Central state for the AutoFix pipeline."""
+    
+    # Configuration
+    project_key: str
+    repo_path: str
+    sonar_server: str
+    sonar_token: str
+    max_rounds: int = 3
+    current_round: int = 0
+    lot_index: int = 0
+    next_action: Optional[str] = None  # "retry" | "next_lot" | "finish"
+    
+    # Pipeline data
+    issues: List[Dict[str, Any]] = []
+    lots: List[Dict[str, Any]] = []
+    current_lot: Optional[Dict[str, Any]] = None
+    
+    # Agent outputs
+    rag_ctx: Dict[str, Any] = {}
+    prop_spec: Dict[str, Any] = {}
+    prop_gen: Dict[str, Any] = {}  # Separated from prop_result
+    prop_result: Dict[str, Any] = {}
+    fix_plan: Dict[str, Any] = {}
+    patch_diff: Optional[str] = None
+    test_report: Dict[str, Any] = {}
+    sonar_rescan: Dict[str, Any] = {}
+    pr_urls: List[str] = []
+    
+    # Flow control
+    next_action: str = "continue"  # "retry", "next_lot", "finish"
+    
+    # Feedback loop
+    feedback: List[str] = []
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 
-class State(TypedDict, total=False):
-    abstract_properties: List["AbstractProperty"]
-    property_tests_passed: bool
-    property_attempts: int
-    property_component: str
-    property_processed_components: List[str]
-    property_test_files: List[str]
-    property_generation_summary: str
-    property_generation_failed: bool
-    property_file_preview: str
-    property_absolute_path: str
-    property_checks: List["PropertyCheck"]
-    property_check_errors: List[str]
-    property_generators: List[str]
-    property_inputs: List["PropertyInput"]
-    property_failures: List[Dict[str, Any]]
-    property_summary: str
-    public_examples: List["PropertyExample"]
-    known_failures: List["PropertyExample"]
-    issue: Issue
-    issues: List[Issue]
-    issues_for_file: List[Issue]
-    issues_scoped: List[Issue]
-    repo_root: str
-    plan_summary: str
-    multi_issue_summary: str
-    context: str
-    patch: str
-    fixer_summary: str
-    executor_summary: str
-    execution_failed: bool
-    test_output: str
-    tester_summary: str
-    test_passed: bool
-    lint_passed: bool
-    sonar_summary: str
-    sonar_passed: bool
-    sonar_remaining_issues: List[Issue]
-    sonar_feedback_attempts: int
-    deployment_summary: str
-    file_path: str
-    tester_file_contents: str
-    tester_issue_summary: str
-    tester_feedback_cases: List[Dict[str, Any]]
-    tester_primary_failure: Dict[str, Any]
-    tester_feedback_summary: str
-    tester_generated_test_files: List[str]
-    pr_url: str
-    branch: str
-    feedback_log: str
-    fix_failed: bool
-    deployment_failed: bool
-    metrics: "Metrics"
-
-
-Role = Literal["requester", "fixer", "tester", "sonar", "deployment"]
-
-
-class AbstractProperty(TypedDict, total=False):
-    name: str
-    description: str
-    target: str
-    function: str
-    inputs: List[str]
-    context: str
-
-
-class PropertyExample(TypedDict):
-    property_name: Optional[str]
-    inputs: Dict[str, Any]
-    output: Any
-
-
-class PropertyInput(TypedDict, total=False):
-    property_name: str
-    inputs: Dict[str, Any]
-
-
-class PropertyCheck(TypedDict, total=False):
-    name: str
-    code: str
-    function_name: str
-    description: str
-
-
-class Metrics(TypedDict, total=False):
-    timings: Dict[str, float]
-    attempts: Dict[str, int]
-    counters: Dict[str, int]
+class A2AMessage(BaseModel):
+    """Message format for agent communication."""
+    
+    sender: str
+    receiver: str
+    content: str
+    metadata: Dict[str, Any] = {}
+    timestamp: Optional[str] = None

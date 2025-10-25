@@ -1,502 +1,578 @@
-"""LangGraph orchestrator for the AutoFix pipeline following the TCC plan."""
-from __future__ import annotations
-
-import json
-import logging
+"""Main orchestrator using LangGraph for AutoFix pipeline."""
 import os
-from dataclasses import asdict, is_dataclass
-from datetime import datetime
+import logging
+import uuid
+import hashlib
+import json
 from pathlib import Path
-from time import perf_counter
-from typing import Any, Callable, Literal
-
+from typing import Dict, Any, List
 from dotenv import load_dotenv
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import END, START, StateGraph
+from .logging_setup import setup_logging, set_ctx, log_event, Span, save_artifact, get_run_artifacts_dir
 
-from app.a2a.deployment_agent import DeploymentAgent
-from app.a2a.fixer_agent_targeted import TargetedFixerAgent as FixerAgent
-from app.a2a.patcher_tool import apply_patch_node
-from app.a2a.planner_agent import invoke as planner_invoke
-from app.a2a.property_agent import PropertyAgent
-from app.a2a.protocol import State
-from app.a2a.requester_agent_optimized import OptimizedRequesterAgent as RequesterAgent
-from app.a2a.sonar_agent import invoke as sonar_invoke
-from app.a2a.tester_agent_simple import SimpleTesterAgent as TesterAgent
+from langgraph.graph import StateGraph, END
+# from langgraph.checkpoint.sqlite import SqliteSaver  # Optional checkpointer
 
-_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
-_LOCAL_ENV = Path(__file__).resolve().parents[1] / ".env"
+from .a2a.protocol import AgentState
+from .sonarqube_client import SonarQubeClient
+from .a2a.property_agent import PropertyAgent
+from .a2a.tester_agent import TesterAgent
+from .a2a.fixer_agent import FixerAgent
+from .patcher import SafePatcher
+from .rag.retriever import RAGRetriever
+from .utils import run_sonar_scanner, mask_secrets
 
-# Load root env first (project-level overrides) then pipeline-specific env.
-if _ROOT_ENV.exists():
-    load_dotenv(dotenv_path=_ROOT_ENV, override=False)
-load_dotenv(dotenv_path=_LOCAL_ENV, override=True)
+# Setup structured logging
+logger = logging.getLogger(__name__)
 
-LOGGER = logging.getLogger(__name__)
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-
-MAX_FEEDBACK_LOOPS = 2
-MAX_PROPERTY_ATTEMPTS = int(os.getenv("MAX_PROPERTY_ATTEMPTS", "3"))
-GRAPH_RECURSION_LIMIT = int(os.getenv("LANGGRAPH_RECURSION_LIMIT", "3"))
+# Load environment
+load_dotenv()
 
 
-def _serialize(value: Any) -> Any:
-    if is_dataclass(value):
-        return asdict(value)
-    if isinstance(value, dict):
-        return {k: _serialize(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_serialize(item) for item in value]
-    return value
-
-
-def _resolve_repo_root() -> Path:
-    candidates = [
-        ("AUTOFIX_TARGET_ROOT", os.getenv("AUTOFIX_TARGET_ROOT")),
-        ("A2A_TARGET_ROOT", os.getenv("A2A_TARGET_ROOT")),
-        ("A2A_REPO_ROOT", os.getenv("A2A_REPO_ROOT")),
-    ]
-    for name, value in candidates:
-        if not value:
-            continue
-        path = Path(value).expanduser()
-        if path.exists():
-            resolved = path.resolve()
-            LOGGER.info("AutoFix utilizando diretório alvo (%s): %s", name, resolved)
-            return resolved
-        LOGGER.warning("Diretório alvo configurado em %s não existe: %s", name, value)
-    default_root = Path.cwd().resolve()
-    LOGGER.info("AutoFix utilizando diretório atual como alvo: %s", default_root)
-    return default_root
-
-
-def _ensure_metrics_container(state: State) -> dict[str, Any]:
-    metrics = state.get("metrics")
-    if not metrics:
-        metrics = {"timings": {}, "attempts": {}, "counters": {}}
-        state["metrics"] = metrics
-    else:
-        metrics.setdefault("timings", {})
-        metrics.setdefault("attempts", {})
-        metrics.setdefault("counters", {})
-    return metrics
-
-
-def _metrics_increment(state: State, counter: str, amount: int = 1) -> None:
-    metrics = _ensure_metrics_container(state)
-    counters = metrics["counters"]
-    counters[counter] = counters.get(counter, 0) + amount
-
-
-def _invoke_with_metrics(state: State, label: str, func: Callable[[State], State]) -> State:
-    metrics = _ensure_metrics_container(state)
-    attempts = metrics["attempts"]
-    attempts[label] = attempts.get(label, 0) + 1
-    start = perf_counter()
-    try:
-        return func(state)
-    finally:
-        elapsed = perf_counter() - start
-        timings = metrics["timings"]
-        timings[label] = timings.get(label, 0.0) + elapsed
-
-
-def build_graph(repo_root: Path | None = None) -> StateGraph:
-    repo_root = Path(repo_root).resolve() if repo_root else _resolve_repo_root()
-    os.environ["A2A_REPO_ROOT"] = str(repo_root)
-
-    requester = RequesterAgent(repo_root=repo_root)
-    fixer = FixerAgent(repo_root=repo_root)
-    tester = TesterAgent(repo_root=repo_root)
-    deployment = DeploymentAgent(repo_root=repo_root)
-    property_agent = PropertyAgent(repo_root=repo_root)
-
-    def planner_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        return _invoke_with_metrics(state, "planner", planner_invoke)
-
-    def property_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        return _invoke_with_metrics(state, "property", property_agent.invoke)
-
-    def property_tester_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        state["tester_mode"] = "properties"
-        result_state = _invoke_with_metrics(state, "tester_properties", tester.invoke)
-        LOGGER.info(
-            "property_tester_node: property_tests_passed=%s, keys=%s",
-            result_state.get("property_tests_passed"),
-            list(result_state.keys()),
+class AutoFixPipeline:
+    """LangGraph-based AutoFix pipeline orchestrator."""
+    
+    def __init__(self):
+        self.sonar_client = SonarQubeClient()
+        self.property_agent = PropertyAgent()
+        self.tester_agent = TesterAgent()
+        self.fixer_agent = FixerAgent()
+        self.patcher = SafePatcher()
+        self.retriever = RAGRetriever()
+        
+        # Build graph
+        self.graph = self._build_graph()
+    
+    def _build_graph(self) -> StateGraph:
+        """Build the LangGraph state machine."""
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("sonar_ingest", self.sonar_ingest)
+        workflow.add_node("plan", self.plan)
+        workflow.add_node("rule_rag", self.rule_rag)
+        workflow.add_node("prop_spec", self.prop_spec)
+        workflow.add_node("prop_gen", self.prop_gen)
+        workflow.add_node("prop_run", self.prop_run)
+        workflow.add_node("fix_plan", self.fix_plan)
+        workflow.add_node("patch", self.patch)
+        workflow.add_node("tests", self.tests)
+        workflow.add_node("sonar_rescan", self.sonar_rescan)
+        workflow.add_node("lot_gate", self.lot_gate)
+        workflow.add_node("update_lot", self.update_lot)
+        workflow.add_node("pr_builder", self.pr_builder)
+        
+        # Add edges
+        workflow.set_entry_point("sonar_ingest")
+        workflow.add_edge("sonar_ingest", "plan")
+        workflow.add_edge("plan", "rule_rag")
+        workflow.add_edge("rule_rag", "prop_spec")
+        workflow.add_edge("prop_spec", "prop_gen")
+        workflow.add_edge("prop_gen", "prop_run")
+        workflow.add_edge("prop_run", "fix_plan")
+        workflow.add_edge("fix_plan", "patch")
+        workflow.add_edge("patch", "tests")
+        workflow.add_edge("tests", "sonar_rescan")
+        workflow.add_edge("sonar_rescan", "lot_gate")
+        
+        # Conditional edges
+        workflow.add_conditional_edges(
+            "lot_gate",
+            self._should_continue,
+            {
+                "continue": "rule_rag",  # Loop back for refinement
+                "next_lot": "update_lot",  # Update lot then continue
+                "finish": "pr_builder"
+            }
         )
-        return result_state
-
-    def property_abort_node(state: State) -> State:
-        LOGGER.info("Pipeline interrompida antes do requester devido a falha nas propriedades")
-        state.setdefault(
-            "property_summary",
-            state.get("property_summary") or "Testes de propriedades falharam.",
+        workflow.add_edge("update_lot", "rule_rag")
+        workflow.add_edge("pr_builder", END)
+        
+        return workflow.compile()
+    
+    def run(self) -> Dict[str, Any]:
+        """Execute the AutoFix pipeline."""
+        # Initialize run context
+        run_id = str(uuid.uuid4())
+        set_ctx(run_id=run_id, node="START")
+        
+        # Initialize state
+        initial_state = AgentState(
+            project_key=os.getenv("SONAR_PROJECT_KEY", ""),
+            repo_path=os.getenv("AUTOFIX_TARGET_ROOT", "."),
+            sonar_server=os.getenv("SONARQUBE_URL", ""),
+            sonar_token=os.getenv("SONARQUBE_TOKEN", ""),
+            max_rounds=int(os.getenv("MAX_ROUNDS", "3"))
         )
-        state.setdefault("deployment_summary", "Pipeline interrompida nas propriedades.")
-        state.setdefault("deployment_failed", True)
-        return state
-
-    def property_router(state: State) -> Literal["property", "property_abort", "requester"]:
-        property_passed = state.get("property_tests_passed")
-        LOGGER.info(
-            "Router de propriedades avaliando resultado: property_tests_passed=%s, attempts=%s",
-            property_passed,
-            state.get("property_attempts"),
-        )
-        if property_passed:
-            state["property_attempts"] = 0
-            return "requester"
-        attempts = int(state.get("property_attempts") or 0) + 1
-        state["property_attempts"] = attempts
-        component = state.get("property_component")
-        processed = set(state.get("property_processed_components") or [])
-        if component and component in processed:
-            processed.discard(component)
-            state["property_processed_components"] = list(processed)
-        _metrics_increment(state, "property_failures")
-        if attempts >= MAX_PROPERTY_ATTEMPTS:
-            LOGGER.error(
-                "Testes de propriedades falharam após %d tentativa(s); interrompendo pipeline.",
-                attempts,
+        
+        log_event("pipeline.start", 
+                 project_key=initial_state.project_key,
+                 repo_path=initial_state.repo_path,
+                 max_rounds=initial_state.max_rounds)
+        
+        try:
+            with Span(logger, "pipeline.execute"):
+                # Execute graph
+                result = self.graph.invoke(initial_state)
+            
+            pr_count = len(result.get('pr_urls', []))
+            log_event("pipeline.complete", pr_count=pr_count, pr_urls=result.get('pr_urls', []))
+            
+            return result
+            
+        except Exception as e:
+            log_event("pipeline.error", error=str(e))
+            logger.error(f"Pipeline failed: {e}", exc_info=True)
+            raise
+    
+    # Node implementations
+    def sonar_ingest(self, state: AgentState) -> Dict[str, Any]:
+        """Run initial scan and collect issues from SonarQube."""
+        set_ctx(node="SONAR_INGEST")
+        
+        try:
+            # Run initial sonar scan
+            with Span(logger, "sonar.initial_scan"):
+                run_sonar_scanner(cwd=state.repo_path)
+            
+            with Span(logger, "sonar.collect_issues"):
+                issues = self.sonar_client.list_issues(state.project_key)
+            
+            log_event("sonar.issues", count=len(issues), project_key=state.project_key)
+            
+            # Save issues artifact
+            issues_path = save_artifact(
+                f"{get_run_artifacts_dir()}/sonar",
+                "issues.json",
+                json.dumps(issues, indent=2)
             )
-            return "property_abort"
-        summary = (state.get("property_summary") or "").strip()
-        if summary:
-            max_log_chars = 4000
-            if len(summary) > max_log_chars:
-                summary = summary[:max_log_chars] + "\n...[truncado]"
-            LOGGER.warning(
-                "Resumo da tentativa %d dos testes de propriedade:\n%s",
-                attempts,
-                summary,
-            )
+            
+            # Normalize issues
+            normalized_issues = []
+            for issue in issues:
+                normalized_issue = self._normalize_issue(issue, state.repo_path)
+                normalized_issues.append(normalized_issue)
+            
+            log_event("sonar.ingest.complete", 
+                     normalized_count=len(normalized_issues),
+                     artifact_path=issues_path)
+            
+            return {"issues": normalized_issues}
+            
+        except Exception as e:
+            log_event("sonar.ingest.error", error=str(e))
+            logger.error(f"SonarQube ingest failed: {e}")
+            return {"issues": []}
+    
+    def plan(self, state: AgentState) -> Dict[str, Any]:
+        """Group issues into lots by rule and directory."""
+        set_ctx(node="PLAN")
+        
+        issues = state.issues
+        lots = {}
+        
+        for issue in issues:
+            rule_key = issue.get("rule", "unknown")
+            component = issue.get("component", "")
+            directory = str(Path(component).parent) if component else "."
+            
+            lot_key = f"{rule_key}#{directory}"
+            
+            if lot_key not in lots:
+                lots[lot_key] = {
+                    "ruleKey": rule_key,
+                    "directory": directory,
+                    "issues": [],
+                    "budget": 300  # LOC limit
+                }
+            
+            lots[lot_key]["issues"].append(issue)
+        
+        lots_list = list(lots.values())
+        
+        # Set lot_id for first lot
+        if lots_list:
+            first_lot = lots_list[0]
+            lot_id = hashlib.sha256(f"{first_lot['ruleKey']}:{first_lot['directory']}".encode()).hexdigest()[:8]
+            set_ctx(lot_id=lot_id)
+        
+        log_event("plan.complete", 
+                 total_issues=len(issues),
+                 lots_count=len(lots_list),
+                 lots=[{"rule": lot["ruleKey"], "dir": lot["directory"], "count": len(lot["issues"])} for lot in lots_list])
+        
+        return {
+            "lots": lots_list,
+            "lot_index": 0,
+            "current_lot": lots_list[0] if lots_list else None
+        }
+    
+    def rule_rag(self, state: AgentState) -> Dict[str, Any]:
+        """Retrieve context for the current rule."""
+        current_lot = state.current_lot
+        if not current_lot:
+            return {"rag_ctx": {}}
+        
+        rule_key = current_lot.get("ruleKey", "")
+        logger.info(f"Retrieving context for rule {rule_key}")
+        
+        query = f"sonar rule {rule_key} fix examples"
+        rag_ctx = self.retriever.retrieve(query)
+        
+        return {"rag_ctx": rag_ctx}
+    
+    def prop_spec(self, state: AgentState) -> Dict[str, Any]:
+        """Generate property specifications."""
+        logger.info("Generating property specifications")
+        
+        prop_spec = self.property_agent.prop_spec(state.model_dump())
+        
+        return {"prop_spec": prop_spec}
+    
+    def prop_gen(self, state: AgentState) -> Dict[str, Any]:
+        """Generate Hypothesis test files."""
+        logger.info("Generating property test files")
+        
+        result = self.property_agent.prop_gen(state.model_dump())
+        
+        return {"prop_gen": result}
+    
+    def prop_run(self, state: AgentState) -> Dict[str, Any]:
+        """Execute property tests."""
+        logger.info("Running property tests")
+        
+        prop_result = self.tester_agent.prop_run(state.repo_path)
+        
+        failed = prop_result.get("failed")
+        if failed is None:
+            # fallback: use exit_code
+            failed = 1 if prop_result.get("exit_code", 1) != 0 else 0
+        if failed > 0:
+            logger.warning("Property tests failed - counterexamples available")
         else:
-            LOGGER.warning(
-                "Resumo da tentativa %d dos testes de propriedade está vazio.",
-                attempts,
-            )
-        LOGGER.warning(
-            "Testes de propriedades falharam (tentativa %d); regenerando propriedades.",
-            attempts,
-        )
-        return "property"
-
-    def requester_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        return _invoke_with_metrics(state, "requester", requester.invoke)
-
-    def fixer_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        return _invoke_with_metrics(state, "fixer", fixer.invoke)
-
-    def tester_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        if state.get("fix_failed"):
-            LOGGER.info("Tester pulado: patch falhou ao ser aplicado")
-            state.setdefault("tester_summary", "Patch não aplicado; tester aguardando nova tentativa")
-            state.setdefault("test_passed", False)
-            state.setdefault("lint_passed", False)
-            _metrics_increment(state, "tester_skipped")
-            return state
-        return _invoke_with_metrics(state, "tester", tester.invoke)
-
-    def feedback_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        def _logic(current: State) -> State:
-            fix_failed = current.get("fix_failed", False)
-            tests_failed = current.get("test_passed") is False
-            loops = current.get("feedback_loops", 0)
-            should_retry = False
-
-            failure_source: str | None = None
-            if fix_failed:
-                failure_source = "fixer"
-            elif tests_failed:
-                failure_source = "tester"
-
-            if failure_source:
-                if loops < MAX_FEEDBACK_LOOPS:
-                    loops += 1
-                    current["feedback_loops"] = loops
-                    if failure_source == "tester":
-                        feedback_text = (
-                            current.get("test_output")
-                            or current.get("tester_summary")
-                            or ""
-                        ).strip()
-                        if not feedback_text:
-                            feedback_text = "Testes falharam, mas nenhuma saída foi capturada."
-                        _metrics_increment(current, "tester_failures")
-                    else:
-                        feedback_text = (current.get("fixer_summary") or "").strip()
-                        if not feedback_text:
-                            feedback_text = "Fixer não conseguiu aplicar o patch."
-                        _metrics_increment(current, "fixer_failures")
-                    entry_header = f"Tentativa {loops} falhou ({failure_source})"
-                    new_entry = f"{entry_header}:\n{feedback_text}"
-                    feedback_log = current.get("feedback_log") or ""
-                    current["feedback_log"] = (
-                        f"{feedback_log}\n\n{new_entry}" if feedback_log else new_entry
-                    )
-                    LOGGER.info(
-                        "Feedback loop #%d acionado após falha (%s)",
-                        loops,
-                        failure_source,
-                    )
-                    if failure_source == "tester":
-                        current["tester_summary"] = current.get("tester_summary") or feedback_text
-                    processed = set(current.get("processed_components") or [])
-                    current_issue = current.get("issue")
-                    if current_issue and getattr(current_issue, "component", None) in processed:
-                        processed.discard(current_issue.component)
-                        LOGGER.debug(
-                            "Feedback loop removendo componente %s de processed_components",
-                            current_issue.component,
-                        )
-                    current["processed_components"] = list(processed)
-                    focused_issues = list(current.get("issues_for_file") or [])
-                    if focused_issues:
-                        component_name = getattr(current_issue, "component", None)
-                        LOGGER.debug(
-                            "Feedback loop restringindo issues à componente %s para nova tentativa",
-                            component_name or "(desconhecido)",
-                        )
-                        current["issues_scoped"] = focused_issues
-                    base_context = (current.get("context") or "").rstrip()
-                    if base_context:
-                        base_context += "\n\n"
-                    current["context"] = f"{base_context}[Feedback da tentativa {loops}]\n{feedback_text}"
-                    current["patch"] = ""
-                    should_retry = True
-                    current["next_after_requester"] = "fixer"
-                    _metrics_increment(current, "feedback_loops")
-                else:
-                    limit_msg = "Limite de tentativas do feedback loop alcançado."
-                    feedback_log = current.get("feedback_log") or ""
-                    current["feedback_log"] = (
-                        f"{feedback_log}\n\n{limit_msg}" if feedback_log else limit_msg
-                    )
-                    LOGGER.info("Feedback loop atingiu o limite de %d tentativas", MAX_FEEDBACK_LOOPS)
+            logger.info("Property tests passed")
+        
+        return {"prop_result": prop_result}
+    
+    def fix_plan(self, state: AgentState) -> Dict[str, Any]:
+        """Generate fix plan."""
+        logger.info("Creating fix plan")
+        
+        fix_plan = self.fixer_agent.fix_plan(state.model_dump())
+        
+        return {"fix_plan": fix_plan}
+    
+    def patch(self, state: AgentState) -> Dict[str, Any]:
+        """Generate and apply patch."""
+        logger.info("Generating and applying patch")
+        
+        patch_diff = self.fixer_agent.generate_patch(state.model_dump())
+        
+        if patch_diff:
+            # Get budget from current lot
+            budget = None
+            if state.current_lot:
+                budget = state.current_lot.get("budget", 300)
+            
+            result = self.patcher.apply_patch(patch_diff, state.repo_path, budget=budget)
+            if result["applied"]:
+                logger.info(f"Patch applied successfully ({result['files_changed']} files)")
+                return {"patch_diff": patch_diff, "patch_applied": True}
             else:
-                if loops:
-                    LOGGER.debug("Feedback loop resetado após sucesso dos testes (antes=%d)", loops)
-                current["feedback_loops"] = 0
-                current["retry_requested"] = False
-                current.pop("next_after_requester", None)
-                current.pop("issues_scoped", None)
-                return current
-
-            current["retry_requested"] = should_retry
-            return current
-
-        return _invoke_with_metrics(state, "feedback", _logic)
-
-    def feedback_router(state: State) -> Literal["requester", "sonar"]:
-        return "requester" if state.get("retry_requested") else "sonar"
-
-    def requester_router(state: State) -> Literal["fixer", "tester"]:
-        next_step = state.pop("next_after_requester", None)
-        if next_step == "tester":
-            return "tester"
-        return "fixer"
-
-    def tester_router(state: State) -> Literal["feedback", "sonar"]:
-        return "sonar" if state.get("test_passed") else "feedback"
-
-    def patcher_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        result = _invoke_with_metrics(state, "patcher", apply_patch_node)
-        if state.get("fix_failed"):
-            state.setdefault("test_passed", False)
-        return result
-
-    def patcher_router(state: State) -> Literal["tester", "feedback"]:
-        return "feedback" if state.get("fix_failed") else "tester"
-
-    def sonar_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        if not state.get("test_passed"):
-            LOGGER.info("Sonar pulado: testes não passaram")
-            state.setdefault("sonar_passed", False)
-            state.setdefault("sonar_summary", "Sonar não executado devido a falha nos testes")
-            _metrics_increment(state, "sonar_skipped")
-            return state
-        return _invoke_with_metrics(state, "sonar", sonar_invoke)
-
-    def sonar_feedback_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-
-        def _logic(current: State) -> State:
-            attempts = int(current.get("sonar_feedback_attempts") or 0) + 1
-            current["sonar_feedback_attempts"] = attempts
-
-            summary = (current.get("sonar_summary") or "Sonar ainda reporta issues abertas.").strip()
-            if summary:
-                base_context = (current.get("context") or "").rstrip()
-                if base_context:
-                    base_context += "\n\n"
-                marker = f"[Sonar tentativa {attempts}]"
-                current["context"] = f"{base_context}{marker}\n{summary}".strip()
-
-            remaining = list(current.get("sonar_remaining_issues") or [])
-            if remaining:
-                current["issues_scoped"] = remaining
-                current["issues_for_file"] = remaining
-                current["issue"] = remaining[0]
-
-            processed = set(current.get("processed_components") or [])
-            current_issue = current.get("issue")
-            component_name = getattr(current_issue, "component", None) if current_issue else None
-            if component_name and component_name in processed:
-                processed.discard(component_name)
-            current["processed_components"] = list(processed)
-            current["patch"] = ""
-            LOGGER.warning(
-                "Sonar identificou issues após tentativa de correção (tentativa %d); retornando ao requester.",
-                attempts,
+                logger.error(f"Patch failed: {result['error']}")
+                return {
+                    "patch_diff": patch_diff, 
+                    "patch_applied": False,
+                    "patch_error": result["error"],
+                    "patch_reason": result.get("reason", "unknown")
+                }
+        else:
+            logger.error("No patch generated")
+            return {"patch_diff": "", "patch_applied": False, "patch_error": "No patch generated"}
+    
+    def tests(self, state: AgentState) -> Dict[str, Any]:
+        """Run full test suite with coverage."""
+        # Skip tests if patch was not applied
+        if not state.model_dump().get("patch_applied", True):
+            logger.warning("Skipping tests - patch was not applied")
+            return {
+                "test_report": {
+                    "status": "skipped",
+                    "exit_code": 0,
+                    "failed": 0,
+                    "tests": 0,
+                    "skipped": 0,
+                    "stdout": "",
+                    "stderr": "Tests skipped due to patch failure",
+                    "coverage_xml_exists": False,
+                    "junit_path": None
+                }
+            }
+        
+        logger.info("Running full test suite with coverage")
+        
+        test_report = self.tester_agent.run_tests_with_coverage(state.repo_path)
+        
+        failed = test_report.get("failed")
+        if failed is None:
+            # fallback: use exit_code
+            failed = 1 if test_report.get("exit_code", 1) != 0 else 0
+        if failed > 0:
+            logger.warning(f"Tests failed: {failed} failures")
+        else:
+            logger.info("All tests passed")
+        
+        return {"test_report": test_report}
+    
+    def sonar_rescan(self, state: AgentState) -> Dict[str, Any]:
+        """Re-run SonarQube scanner."""
+        logger.info("Re-scanning with SonarQube")
+        
+        try:
+            # Run scanner with coverage
+            run_sonar_scanner(
+                cwd=state.repo_path,
+                extra_args=["-Dsonar.python.coverage.reportPaths=coverage.xml"]
             )
-            _metrics_increment(current, "sonar_feedback")
-            return current
-
-        return _invoke_with_metrics(state, "sonar_feedback", _logic)
-
-    def sonar_router(state: State) -> Literal["deployment", "sonar_feedback"]:
-        if state.get("sonar_passed"):
-            if state.get("sonar_feedback_attempts"):
-                LOGGER.debug(
-                    "Sonar recuperou sucesso após %d tentativa(s)",
-                    state.get("sonar_feedback_attempts"),
-                )
-            state["sonar_feedback_attempts"] = 0
-            return "deployment"
-        attempts = int(state.get("sonar_feedback_attempts") or 0)
-        if attempts >= MAX_FEEDBACK_LOOPS:
-            LOGGER.error(
-                "Sonar falhou após %d tentativa(s); prosseguindo para deployment mesmo assim.",
-                attempts,
-            )
-            return "deployment"
-        LOGGER.info("Sonar detectou issues remanescentes; iniciando feedback para nova tentativa.")
-        _metrics_increment(state, "sonar_failures")
-        return "sonar_feedback"
-
-    def deployment_node(state: State) -> State:
-        state.setdefault("repo_root", repo_root.as_posix())
-        return _invoke_with_metrics(state, "deployment", deployment.invoke)
-
-    builder = StateGraph(State)
-    builder.add_node("planner", planner_node)
-    builder.add_node("property", property_node)
-    builder.add_node("property_tester", property_tester_node)
-    builder.add_node("property_abort", property_abort_node)
-    builder.add_node("requester", requester_node)
-    builder.add_node("feedback", feedback_node)
-    builder.add_node("tester", tester_node)
-    builder.add_node("fixer", fixer_node)
-    builder.add_node("patcher", patcher_node)
-    builder.add_node("sonar", sonar_node)
-    builder.add_node("sonar_feedback", sonar_feedback_node)
-    builder.add_node("deployment", deployment_node)
-
-    builder.add_edge(START, "planner")
-    builder.add_edge("planner", "property")
-    builder.add_edge("property", "property_tester")
-    builder.add_conditional_edges("property_tester", property_router)
-    builder.add_conditional_edges("requester", requester_router)
-    builder.add_conditional_edges("tester", tester_router)
-    builder.add_conditional_edges("feedback", feedback_router)
-    builder.add_edge("fixer", "patcher")
-    builder.add_conditional_edges("patcher", patcher_router)
-    builder.add_conditional_edges("sonar", sonar_router)
-    builder.add_edge("sonar_feedback", "requester")
-    builder.add_edge("property_abort", END)
-    builder.add_edge("deployment", END)
-
-    return builder
-
-
-def _persist_metrics(state: State, repo_root: Path) -> None:
-    metrics = state.get("metrics")
-    if not metrics:
-        LOGGER.info("Nenhuma métrica registrada para persistir.")
-        return
-
-    output_hint = os.getenv("PIPELINE_METRICS_PATH")
-    if output_hint:
-        target = Path(output_hint)
-        if target.is_dir():
-            target = target / "metrics.jsonl"
-    else:
-        target = repo_root / "artifacts" / "metrics.jsonl"
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-
-    issue = state.get("issue")
-    record = {
-        "timestamp": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "repo_root": repo_root.as_posix(),
-        "active_issue": getattr(issue, "key", None) if issue else None,
-        "issues_processed": len(state.get("processed_components") or []),
-        "feedback_loops": state.get("feedback_loops", 0),
-        "tests_passed": state.get("test_passed"),
-        "sonar_passed": state.get("sonar_passed"),
-        "metrics": metrics,
-    }
-
-    with target.open("a", encoding="utf-8") as handler:
-        handler.write(json.dumps(record, ensure_ascii=False) + "\n")
-
-    LOGGER.info("Métricas registradas em %s", target)
-
-
-def run_pipeline() -> State:
-    from app.utils import run_sonar_scanner
+            
+            # Get fresh issues (OPEN status only)
+            fresh_issues = self.sonar_client.list_issues(state.project_key, status="OPEN")
+            
+            # Filter issues for current lot
+            if state.current_lot:
+                rule = state.current_lot["ruleKey"]
+                target_dir = state.current_lot["directory"]
+                lot_issues = [
+                    i for i in fresh_issues
+                    if i.get("rule") == rule 
+                    and target_dir in i.get("component", "")
+                    and i.get("status") == "OPEN"
+                ]
+            else:
+                lot_issues = []
+            
+            # Check quality gate
+            qg = self.sonar_client.quality_gate(state.project_key)
+            
+            return {
+                "sonar_rescan": {
+                    "quality_gate": qg.get("projectStatus", {}).get("status", "ERROR"),
+                    "lot_clean": len(lot_issues) == 0,
+                    "total_issues": len(fresh_issues)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Sonar rescan failed: {e}")
+            return {
+                "sonar_rescan": {
+                    "quality_gate": "ERROR",
+                    "lot_clean": False,
+                    "error": str(e)
+                }
+            }
     
-    repo_root = _resolve_repo_root()
-    os.environ["A2A_REPO_ROOT"] = str(repo_root)
+    def lot_gate(self, state: AgentState) -> Dict[str, Any]:
+        """Decide whether to continue, process next lot, or finish."""
+        sonar_rescan = state.sonar_rescan
+        ok_gate = sonar_rescan.get("quality_gate") == "OK"
+        lot_clean = sonar_rescan.get("lot_clean", False)
+        
+        if ok_gate and lot_clean:
+            # próximo lote ou finalizar
+            if state.lot_index + 1 < len(state.lots):
+                return {"next_action": "next_lot"}
+            else:
+                return {"next_action": "finish"}
+        
+        if state.current_round + 1 < state.max_rounds:
+            return {
+                "next_action": "retry",
+                "current_round": state.current_round + 1
+            }
+        
+        # Max rounds reached - skip to next lot or finish
+        if state.lot_index + 1 < len(state.lots):
+            return {"next_action": "next_lot"}
+        else:
+            return {"next_action": "finish"}
     
-    # Execute sonar-scanner first
-    LOGGER.info("Executando sonar-scanner inicial em %s", repo_root)
-    try:
-        run_sonar_scanner(cwd=repo_root)
-        LOGGER.info("Sonar-scanner executado com sucesso")
-    except Exception as e:
-        LOGGER.error("Falha no sonar-scanner: %s", e)
-        return {"error": str(e)}
+    def pr_builder(self, state: AgentState) -> Dict[str, Any]:
+        """Create pull request."""
+        logger.info("Creating pull request")
+        
+        try:
+            pr_result = self._create_pr(state)
+            return {"pr_urls": [pr_result.get("pr_url", "")]}
+        except Exception as e:
+            logger.error(f"PR creation failed: {e}")
+            return {"pr_urls": []}
     
-    pipeline_start = perf_counter()
-    graph_builder = build_graph(repo_root=repo_root)
-    graph = graph_builder.compile(checkpointer=MemorySaver())
-    LOGGER.info("Iniciando pipeline AutoFix")
-    final_state: State = graph.invoke(
-        {},
-        config={
-            "recursion_limit": GRAPH_RECURSION_LIMIT,
-            "configurable": {"thread_id": "autofix"},
-        },
-    )
-    LOGGER.info("Pipeline concluída")
-    pipeline_elapsed = perf_counter() - pipeline_start
+    def _create_pr(self, state: AgentState) -> Dict[str, Any]:
+        """Create a real pull request using git and gh CLI."""
+        import hashlib
+        from .utils import run_cmd
+        
+        lot = state.current_lot
+        if not lot:
+            raise ValueError("No current lot available for PR creation")
+        
+        # Generate unique branch name
+        rule_key = lot.get("ruleKey", "unknown")
+        directory = lot.get("directory", "")
+        suffix = hashlib.sha1(f'{rule_key}:{directory}'.encode()).hexdigest()[:8]
+        branch = f'fix/sonar-{rule_key.lower().replace(":", "-")}-{suffix}'
+        
+        repo_path = state.repo_path
+        
+        # Create and checkout branch
+        result = run_cmd(["git", "checkout", "-b", branch], workdir=repo_path)
+        if result["exit_code"] != 0:
+            raise RuntimeError(f"Failed to create branch: {result['stderr']}")
+        
+        # Stage all changes
+        result = run_cmd(["git", "add", "-A"], workdir=repo_path)
+        if result["exit_code"] != 0:
+            raise RuntimeError(f"Failed to stage changes: {result['stderr']}")
+        
+        # Check if there are changes to commit
+        result = run_cmd(["git", "diff", "--cached", "--quiet"], workdir=repo_path)
+        if result["exit_code"] == 0:
+            logger.info("No changes to commit - skipping PR creation")
+            return {"branch": branch, "pr_url": ""}
+        
+        # Commit changes
+        commit_msg = f'fix(sonar): {rule_key} — lote {directory}'
+        result = run_cmd(["git", "commit", "-m", commit_msg], workdir=repo_path)
+        if result["exit_code"] != 0:
+            raise RuntimeError(f"Failed to commit: {result['stderr']}")
+        
+        # Push branch
+        result = run_cmd(["git", "push", "-u", "origin", branch], workdir=repo_path)
+        if result["exit_code"] != 0:
+            raise RuntimeError(f"Failed to push branch: {result['stderr']}")
+        
+        # Create PR using gh CLI
+        pr_title = f"fix(sonar): Resolve {rule_key} violations"
+        pr_body = self._generate_pr_body(lot, state)
+        
+        result = run_cmd([
+            "gh", "pr", "create",
+            "--title", pr_title,
+            "--body", pr_body,
+            "--head", branch,
+            "--base", os.getenv("BASE_BRANCH", "main")
+        ], workdir=repo_path)
+        
+        if result["exit_code"] != 0:
+            raise RuntimeError(f"Failed to create PR: {result['stderr']}")
+        
+        pr_url = result["stdout"].strip()
+        logger.info(f"Created PR: {pr_url}")
+        
+        return {"branch": branch, "pr_url": pr_url}
+    
+    def _generate_pr_body(self, lot: Dict[str, Any], state: AgentState) -> str:
+        """Generate PR description body."""
+        rule_key = lot.get("ruleKey", "unknown")
+        issues = lot.get("issues", [])
+        directory = lot.get("directory", "")
+        
+        body = f"""## AutoFix: {rule_key}
 
-    metrics = _ensure_metrics_container(final_state)
-    timings = metrics["timings"]
-    timings["pipeline_total_seconds"] = timings.get("pipeline_total_seconds", 0.0) + pipeline_elapsed
-    counters = metrics["counters"]
-    counters["pipeline_runs"] = counters.get("pipeline_runs", 0) + 1
+**Rule**: {rule_key}
+**Directory**: {directory}
+**Issues Fixed**: {len(issues)}
 
-    serializable = {k: _serialize(v) for k, v in final_state.items()}
-    LOGGER.debug("Estado final:\n%s", json.dumps(serializable, ensure_ascii=False, indent=2))
-    _persist_metrics(final_state, repo_root)
-    return final_state
+### Changes Made
+
+This PR automatically fixes SonarQube violations for rule `{rule_key}` in the `{directory}` directory.
+
+### Issues Addressed
+
+"""
+        
+        for i, issue in enumerate(issues[:5], 1):  # Limit to 5 issues
+            component = issue.get("component_path") or issue.get("component", "")
+            line = issue.get("line", "")
+            message = issue.get("message", "")
+            body += f"{i}. **{component}:{line}** - {message}\n"
+        
+        if len(issues) > 5:
+            body += f"\n... and {len(issues) - 5} more issues\n"
+        
+        body += "\n### Quality Gate\n\n"
+        
+        sonar_rescan = state.sonar_rescan
+        if sonar_rescan:
+            qg_status = sonar_rescan.get("quality_gate", "UNKNOWN")
+            lot_clean = sonar_rescan.get("lot_clean", False)
+            body += f"- Quality Gate: {qg_status}\n"
+            body += f"- Lot Clean: {'✅ Yes' if lot_clean else '❌ No'}\n"
+        
+        body += "\n---\n*Generated by AutoFix Pipeline*"
+        
+        return body
+    
+    def _normalize_issue(self, issue: Dict[str, Any], repo_path: str) -> Dict[str, Any]:
+        """Normalize issue with resolved paths and metadata."""
+        import os
+        
+        # Resolve component path
+        component = issue.get("component", "")
+        if ":" in component:
+            rel_path = component.split(":", 1)[1]
+        else:
+            rel_path = component
+        
+        component_path = os.path.normpath(os.path.join(repo_path, rel_path))
+        directory = os.path.dirname(component_path)
+        
+        # Add normalized fields
+        issue["ruleKey"] = issue.get("rule", "")
+        issue["type"] = issue.get("type", "CODE_SMELL")  # Bug/Vulnerability/Code_Smell
+        issue["component_path"] = component_path
+        issue["dir"] = directory
+        
+        return issue
+    
+    def update_lot(self, state: AgentState) -> Dict[str, Any]:
+        """Update to next lot."""
+        new_index = state.lot_index + 1
+        if new_index < len(state.lots):
+            new_lot = state.lots[new_index]
+            logger.info(f"Moving to lot {new_index}: {new_lot.get('ruleKey', 'unknown')}")
+            return {
+                "lot_index": new_index,
+                "current_lot": new_lot,
+                "current_round": 0
+            }
+        return {}
+    
+    def _should_continue(self, state: AgentState) -> str:
+        """Determine next step based on lot gate status."""
+        if state.next_action == "retry":
+            return "continue"
+        if state.next_action == "next_lot":
+            # Update lot index and current lot
+            new_index = state.lot_index + 1
+            if new_index < len(state.lots):
+                # This will be handled by updating the state in the graph
+                return "next_lot"
+            else:
+                return "finish"
+        return "finish"
+
+
+def main():
+    """Main entry point."""
+    # Setup logging first
+    setup_logging()
+    
+    pipeline = AutoFixPipeline()
+    result = pipeline.run()
+    
+    print(f"Pipeline completed. PRs: {result.get('pr_urls', [])}")
 
 
 if __name__ == "__main__":
-    try:
-        run_pipeline()
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.exception("Falha durante pipeline: %s", exc)
-        raise
+    main()

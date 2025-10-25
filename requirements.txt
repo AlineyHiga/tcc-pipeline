@@ -1,1 +1,27 @@
--r ../requirements.txt
+# Core LangGraph Pipeline (v1.0+)
+langgraph>=1.0.0
+langchain>=1.0.0
+langchain-community>=0.4.0
+langchain-openai>=1.0.0
+
+# RAG and Embeddings
+chromadb>=1.2.0
+sentence-transformers>=5.0.0
+
+# Property-Based Testing
+pytest>=8.4.0
+hypothesis>=6.140.0
+pytest-cov>=6.0.0
+coverage>=7.0.0
+
+# Core Utilities
+requests>=2.32.0
+pydantic>=2.12.0
+python-dotenv>=1.0.0
+gitpython>=3.1.0
+pathspec>=0.12.0
+unidiff>=0.7.0
+libcst>=1.1.0
+
+# LLM Support
+openai>=2.0.0
