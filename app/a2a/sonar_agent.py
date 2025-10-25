@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Dict, List
 
@@ -41,7 +42,10 @@ def invoke(state: State) -> State:
     repo_root = _resolve_repo_root(state)
     LOGGER.debug("Sonar agent running with repo root %s", repo_root)
     try:
+        LOGGER.info("Executando sonar-scanner...")
         run_sonar_scanner(cwd=repo_root)
+        LOGGER.info("Sonar-scanner concluído, aguardando processamento...")
+        time.sleep(2)  # Give SonarQube time to process
     except RuntimeError as exc:
         message = f"Falha ao executar sonar-scanner: {exc}"
         LOGGER.error(message)
@@ -57,7 +61,9 @@ def invoke(state: State) -> State:
     ce_task_id = metadata.get("ceTaskId")
     if ce_task_id:
         try:
+            LOGGER.info(f"Aguardando processamento da tarefa CE: {ce_task_id}")
             client.wait_for_ce_task(ce_task_id)
+            LOGGER.info("Processamento CE concluído")
         except (RuntimeError, TimeoutError) as exc:
             message = f"Falha ao aguardar processamento do Sonar: {exc}"
             LOGGER.error(message)
@@ -69,24 +75,29 @@ def invoke(state: State) -> State:
             )
             return state
     else:
-        LOGGER.warning("Metadados do Sonar não contém ceTaskId; prosseguindo sem aguardar a fila")
+        LOGGER.warning("Metadados do Sonar não contém ceTaskId; aguardando 3s antes de buscar issues")
+        time.sleep(3)  # Extra wait when no CE task ID
 
+    LOGGER.info("Buscando issues do SonarQube...")
     issues = client.search_issues(statuses=("OPEN", "REOPENED", "CONFIRMED"), resolved=False)
+    LOGGER.info(f"SonarQube retornou {len(issues)} issues no total")
     if issues:
         formatted_issues = "\n\n".join(format_issue(issue) for issue in issues)
         LOGGER.debug("Issues retornadas pelo Sonar:\n%s", formatted_issues)
     else:
         LOGGER.debug("Nenhuma issue retornada pelo Sonar.")
 
-    target_components = {
-        issue.component for issue in (state.get("issues_for_file") or []) if issue
-    }
-    if not target_components and state.get("issue"):
-        target_components = {state["issue"].component}
-
+    # Get the current file being processed
+    current_file = state.get("file_path", "")
+    if not current_file and state.get("issue"):
+        current_file = getattr(state["issue"], "component", "")
+    
+    LOGGER.info(f"Sonar checking issues for file: {current_file}")
+    
     remaining: List[Issue] = []
     for item in issues:
-        if item.component in target_components:
+        # Include all issues from the current file being processed
+        if current_file and (item.component == current_file or item.component.endswith(current_file)):
             status = (item.status or "").upper()
             if status in {"CLOSED", "RESOLVED"}:
                 LOGGER.debug("Ignorando issue resolvida %s com status %s", item.key, status)
@@ -101,15 +112,18 @@ def invoke(state: State) -> State:
                     line=item.line,
                 )
             )
+            LOGGER.debug(f"Found issue: {item.rule} @ line {item.line}: {item.message}")
 
     if remaining:
         formatted = "\n".join(
             f"[{iss.severity}] {iss.rule} @ {iss.component}:{iss.line} — {iss.message}"
             for iss in remaining
         )
-        summary = f"Issues remanescentes no arquivo:\n{formatted}"
+        summary = f"Issues remanescentes no arquivo {current_file}:\n{formatted}"
+        LOGGER.info(f"Found {len(remaining)} remaining issues in {current_file}")
     else:
-        summary = "0 issues restantes para o arquivo alvo"
+        summary = f"0 issues restantes para o arquivo {current_file}"
+        LOGGER.info(f"All issues resolved in {current_file}")
 
     state.update(
         {

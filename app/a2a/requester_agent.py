@@ -48,9 +48,20 @@ class RequesterAgent:
         env_root = os.getenv("A2A_REPO_ROOT")
         base = Path(repo_root) if repo_root else Path(env_root) if env_root else Path.cwd()
         self.repo_root = base.resolve()
-        self.max_file_chars = int(os.getenv("REQUESTER_MAX_FILE_CHARS", "6000"))
-        self.max_context_chars = int(os.getenv("REQUESTER_MAX_CONTEXT_CHARS", "9000"))
+        self.max_file_chars = int(os.getenv("REQUESTER_MAX_FILE_CHARS", "2000"))  # Reduced from 6000
+        self.max_context_chars = int(os.getenv("REQUESTER_MAX_CONTEXT_CHARS", "4000"))  # Reduced from 9000
         self._last_file_path: Optional[Path] = None
+        
+        # Initialize enhanced RAG service with auto-build
+        try:
+            from app.rag_builder import auto_build_rag_index
+            auto_build_rag_index(self.repo_root)
+            
+            from rag_service.service import RAGService
+            self.rag_service = RAGService(str(self.repo_root / ".rag_index"))
+        except (ImportError, Exception) as e:
+            self.rag_service = None
+            LOGGER.warning(f"Enhanced RAG service not available: {e}")
 
     # Public API ----------------------------------------------------------
     def invoke(self, state: State) -> State:
@@ -369,10 +380,38 @@ class RequesterAgent:
             lines.append("Arquivos de testes gerados:\n" + "\n".join(f"- {path}" for path in tester_generated))
         if fixer_feedback:
             lines.append("Falha anterior do Fixer:\n" + fixer_feedback.strip())
-        if file_text_numbered.strip():
-            lines.append("Código com numeração de linhas:\n" + file_text_numbered)
+        # Use enhanced RAG for minimal context
+        if self.rag_service and issues:
+            try:
+                issue = issues[0]
+                result = self.rag_service.retrieve_for_issue(
+                    file_path=file_path,
+                    line=getattr(issue, 'line', 1),
+                    rule=getattr(issue, 'rule', ''),
+                    message=getattr(issue, 'message', ''),
+                    k=2  # Reduced from 5 to 2
+                )
+                
+                # Get code for target symbol only (most relevant)
+                target_id = f"{result['target']['path']}::{result['target']['symbol']}"
+                code_map = self.rag_service.get_code_for_symbols([target_id])
+                
+                if code_map:
+                    target_code = list(code_map.values())[0]
+                    lines.append(f"Função alvo: {result['target']['symbol']}\n{target_code}")
+                    LOGGER.info(f"RAG forneceu {len(target_code)} chars para {result['target']['symbol']}")
+                else:
+                    # Fallback to function extraction
+                    lines.append("Código com numeração de linhas:\n" + file_text_numbered[:1500])
+            except Exception as e:
+                LOGGER.debug(f"RAG service error: {e}")
+                # Fallback to function extraction
+                lines.append("Código com numeração de linhas:\n" + file_text_numbered[:1200])
         else:
-            lines.append("Código do arquivo indisponível.")
+            if file_text_numbered.strip():
+                lines.append("Código com numeração de linhas:\n" + file_text_numbered[:1200])  # Reduced from 2000
+            else:
+                lines.append("Código do arquivo indisponível.")
         return "\n".join(lines)
 
     def _truncate(self, text: str) -> str:

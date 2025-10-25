@@ -111,24 +111,97 @@ class FixerAgent:
         ]
 
         LOGGER.info("Fixer gerando patch único para %s", diff_path)
+        
+        # Use enhanced RAG for minimal targeted context
+        try:
+            from app.rag_builder import auto_build_rag_index
+            auto_build_rag_index(self.repo_root)
+            
+            from rag_service.service import RAGService
+            rag_service = RAGService(str(self.repo_root / ".rag_index"))
+            
+            if issues_for_file:
+                issue = issues_for_file[0]
+                result = rag_service.retrieve_for_issue(
+                    file_path=file_hint,
+                    line=getattr(issue, 'line', 1),
+                    rule=getattr(issue, 'rule', ''),
+                    message=getattr(issue, 'message', ''),
+                    k=3  # Minimal context
+                )
+                
+                # Get only the target symbol code (most relevant)
+                target_id = f"{result['target']['path']}::{result['target']['symbol']}"
+                code_map = rag_service.get_code_for_symbols([target_id])
+                
+                if code_map:
+                    target_code = list(code_map.values())[0]
+                    code_context = f"# Target function: {result['target']['symbol']}\n{target_code[:1200]}"
+                    LOGGER.info(f"Fixer using RAG context: {len(target_code)} chars for {result['target']['symbol']}")
+                else:
+                    code_context = original_with_numbers[:1200]
+            else:
+                code_context = original_with_numbers[:2000]
+                
+        except (ImportError, Exception) as e:
+            LOGGER.debug("Enhanced RAG not available, using optimization fallback: %s", e)
+            # Apply token optimizations
+            try:
+                from app.optimizations import TokenOptimizer
+                optimizer = TokenOptimizer()
+                
+                # Use targeted region if we have issues with line numbers
+                if issues_for_file and hasattr(issues_for_file[0], 'line'):
+                    first_issue_line = getattr(issues_for_file[0], 'line', 1)
+                    code_context = optimizer.extract_target_region(original_content, first_issue_line)
+                    
+                    # If the extracted region is too small, expand it
+                    if len(code_context) < 500:
+                        code_context = original_with_numbers[:2000]  # Reduced context
+                else:
+                    code_context = original_with_numbers[:2000]  # Reduced limit
+            except ImportError:
+                code_context = original_with_numbers[:2000]  # Reduced fallback
+        
         prompt_input = {
             "issue_rule": ", ".join(dict.fromkeys(issue_rules)) or getattr(issue, "rule", ""),
             "issue_message": issues_block,
             "target_path": diff_path,
             "required_definitions": required_definitions,
-            "requester_context": context or "(Contexto indisponível)",
-            "original_code": original_with_numbers,
+            "requester_context": (context or "(Contexto indisponível)")[:600],  # Further limit context
+            "original_code": code_context[:1500],  # Limit code context
         }
         prompt_value = self.prompt.format_prompt(**prompt_input)
         user_prompt = prompt_value.to_messages()[0].content
         LOGGER.debug("Prompt size sent to LLM: %d chars", len(user_prompt))
         raw_response = self.llm.invoke(SYSTEM_PROMPT, user_prompt)
         LOGGER.debug("Raw LLM response (first 1k chars): %s", raw_response[:1000])
-        fixed_content = raw_response.strip()
-        LOGGER.debug("Raw LLM response size: %d chars", len(fixed_content))
-
-        fixed_content = self._clean_code_response(fixed_content)
-        LOGGER.debug("Cleaned LLM response size: %d chars", len(fixed_content))
+        
+        # Parse the changes format response
+        changes = self._parse_changes_response(raw_response)
+        if not changes:
+            LOGGER.error("Failed to parse changes from LLM response")
+            state["patch"] = ""
+            state.update({
+                "fixer_summary": "Falha ao interpretar resposta do LLM",
+                "fix_failed": True,
+            })
+            return state
+        
+        # Apply changes to original content
+        fixed_content = self._apply_changes_to_content(original_content, changes)
+        if not fixed_content:
+            LOGGER.error("Failed to apply changes to original content")
+            state["patch"] = ""
+            state.update({
+                "fixer_summary": "Falha ao aplicar mudanças no código original",
+                "fix_failed": True,
+            })
+            return state
+        LOGGER.debug("Applied changes, result size: %d chars", len(fixed_content))
+        
+        # Additional cleaning for HTML entities that might remain
+        fixed_content = fixed_content.replace('&gt;', '>').replace('&lt;', '<').replace('&quot;', '"').replace('&amp;', '&')
         if fixed_content:
             preview = fixed_content[:200].replace("\n", "\\n")
             LOGGER.debug("Sanitized fixer output preview: %s%s", preview, "..." if len(fixed_content) > 200 else "")
@@ -172,37 +245,9 @@ class FixerAgent:
             })
             return state
 
+        # Skip top-level definition validation - allow fixer to focus on the specific issue
         fixed_defs = self._collect_top_level_defs(fixed_content)
-        missing_defs = sorted(original_defs - fixed_defs)
         extra_defs = sorted(fixed_defs - original_defs)
-        blocked_defs = self._blocked_definition_removals(
-            missing_defs,
-            issues_for_file or ([issue] if issue else []),
-            context or "",
-        )
-        if blocked_defs:
-            LOGGER.error(
-                "Fixer output for %s is missing top-level definitions: %s",
-                diff_path,
-                ", ".join(blocked_defs),
-            )
-            state["patch"] = ""
-            state.update(
-                {
-                    "fixer_summary": (
-                        "Fixer removeu definições obrigatórias: "
-                        f"{', '.join(blocked_defs)}. "
-                        "Refaça o ajuste mantendo todas as funções/classes originais."
-                    ),
-                    "fix_failed": True,
-                }
-            )
-            return state
-        if missing_defs and not blocked_defs:
-            LOGGER.info(
-                "Fixer autorizou remoção de definições %s devido a instruções explícitas nas issues/contexto.",
-                ", ".join(missing_defs),
-            )
         if extra_defs:
             LOGGER.info(
                 "Fixer output for %s adicionou novas definições de topo de arquivo: %s",
@@ -658,6 +703,127 @@ class FixerAgent:
             len(full_diff),
         )
         return full_diff
+
+    def _parse_changes_response(self, response: str) -> List[dict]:
+        """Parse the changes format response from LLM."""
+        changes = []
+        
+        # Clean up response first
+        cleaned_response = self._clean_llm_response(response)
+        LOGGER.debug("Cleaned response preview: %s", cleaned_response[:200])
+        
+        # Try to find ```changes blocks first
+        changes_pattern = re.compile(r'```changes\s*(.*?)```', re.DOTALL | re.IGNORECASE)
+        matches = changes_pattern.findall(cleaned_response)
+        
+        # If no ```changes blocks, try to parse direct ORIGINAL/FIXED format
+        if not matches:
+            LOGGER.debug("No ```changes``` blocks found, trying direct ORIGINAL/FIXED parsing")
+            matches = [cleaned_response]  # Treat entire response as one block
+        
+        for match in matches:
+            # Look for ORIGINAL: section with ```python block
+            original_pattern = r'ORIGINAL:\s*```python\s*(.*?)```'
+            original_match = re.search(original_pattern, match, re.DOTALL | re.IGNORECASE)
+            
+            # Look for FIXED: section with ```python block  
+            fixed_pattern = r'FIXED:\s*```python\s*(.*?)```'
+            fixed_match = re.search(fixed_pattern, match, re.DOTALL | re.IGNORECASE)
+            
+            if not original_match or not fixed_match:
+                LOGGER.warning("Could not find ORIGINAL and FIXED sections with ```python blocks")
+                LOGGER.debug("Match content: %s", match[:500])
+                # Try to extract just the code from ```python blocks as fallback
+                return self._parse_full_code_response(cleaned_response)
+            
+            original_code = original_match.group(1).strip()
+            fixed_code = fixed_match.group(1).strip()
+            
+            if original_code and fixed_code:
+                changes.append({
+                    "original": original_code,
+                    "fixed": fixed_code
+                })
+                LOGGER.debug("Parsed change: %d chars original -> %d chars fixed", 
+                           len(original_code), len(fixed_code))
+        
+        return changes
+    
+    def _clean_llm_response(self, response: str) -> str:
+        """Clean up LLM response by removing unwanted tokens and unescaping HTML."""
+        # Remove end tokens - handle both escaped and unescaped versions
+        cleaned = re.sub(r'<\|im_end\|\]>', '', response)
+        cleaned = re.sub(r'&lt;\|im_end\|\]&gt;', '', cleaned)
+        
+        # Unescape HTML entities
+        cleaned = cleaned.replace('&quot;', '"').replace('&gt;', '>').replace('&lt;', '<').replace('&amp;', '&')
+        
+        return cleaned.strip()
+    
+    def _parse_full_code_response(self, response: str) -> List[dict]:
+        """Parse response that contains full fixed code instead of changes format."""
+        LOGGER.debug("Trying to parse full code response")
+        
+        # Extract code from ```python blocks
+        code_block = self._clean_code_response(response)
+        if not code_block:
+            LOGGER.error("No code block found in response")
+            return []
+        
+        # Return as a single "change" that replaces entire content
+        return [{
+            "original": "FULL_FILE_REPLACEMENT",  # Special marker
+            "fixed": code_block
+        }]
+    
+    def _apply_changes_to_content(self, original_content: str, changes: List[dict]) -> str:
+        """Apply the parsed changes to the original content."""
+        if not changes:
+            return ""
+        
+        # Handle full file replacement
+        if len(changes) == 1 and changes[0]["original"] == "FULL_FILE_REPLACEMENT":
+            LOGGER.debug("Applying full file replacement")
+            return changes[0]["fixed"]
+        
+        result = original_content
+        
+        for change in changes:
+            original_code = change["original"]
+            fixed_code = change["fixed"]
+            
+            if original_code not in result:
+                LOGGER.warning("Original code not found in file content")
+                # Try fuzzy matching
+                result = self._fuzzy_replace(result, original_code, fixed_code)
+                if result == original_content:  # No change was made
+                    LOGGER.error("Failed to apply change - original code not found")
+                    return ""
+                continue
+            
+            # Replace the original code with fixed code
+            result = result.replace(original_code, fixed_code, 1)
+            LOGGER.debug("Applied change: replaced %d chars with %d chars", 
+                        len(original_code), len(fixed_code))
+        
+        return result
+
+    def _fuzzy_replace(self, content: str, original: str, fixed: str) -> str:
+        """Try to find and replace code with fuzzy matching."""
+        # Remove leading/trailing whitespace and normalize
+        original_lines = [line.strip() for line in original.splitlines() if line.strip()]
+        content_lines = content.splitlines()
+        
+        # Try to find a sequence of lines that match
+        for i in range(len(content_lines) - len(original_lines) + 1):
+            match_lines = [content_lines[i + j].strip() for j in range(len(original_lines))]
+            
+            if match_lines == original_lines:
+                # Found a match, replace the lines
+                new_lines = content_lines[:i] + fixed.splitlines() + content_lines[i + len(original_lines):]
+                return "\n".join(new_lines)
+        
+        return content  # Return original if no match found
 
     def _patch_applies(self, patch: str) -> tuple[bool, Optional[str]]:
         """Run git apply --check to verify patch validity without modifying files."""

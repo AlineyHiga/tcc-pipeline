@@ -15,14 +15,14 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
 from app.a2a.deployment_agent import DeploymentAgent
-from app.a2a.fixer_agent import FixerAgent
+from app.a2a.fixer_agent_targeted import TargetedFixerAgent as FixerAgent
 from app.a2a.patcher_tool import apply_patch_node
 from app.a2a.planner_agent import invoke as planner_invoke
 from app.a2a.property_agent import PropertyAgent
 from app.a2a.protocol import State
-from app.a2a.requester_agent import RequesterAgent
+from app.a2a.requester_agent_optimized import OptimizedRequesterAgent as RequesterAgent
 from app.a2a.sonar_agent import invoke as sonar_invoke
-from app.a2a.tester_agent import TesterAgent
+from app.a2a.tester_agent_simple import SimpleTesterAgent as TesterAgent
 
 _ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
 _LOCAL_ENV = Path(__file__).resolve().parents[1] / ".env"

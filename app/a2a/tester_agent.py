@@ -160,6 +160,38 @@ class TesterAgent:
     def _run_property_pytests(self, files: List[Path]) -> Tuple[bool, str, bool]:
         if not files:
             return False, "Nenhum arquivo de testes de propriedade foi fornecido.", False
+        
+        # Check for isolation requirements
+        for test_file in files:
+            isolation_file = test_file.with_suffix(".isolation.json")
+            if isolation_file.exists():
+                try:
+                    from app.test_isolation import TestIsolationManager
+                    import json
+                    
+                    isolation_info = json.loads(isolation_file.read_text())
+                    deps = isolation_info.get("dependencies", [])
+                    
+                    LOGGER.info(f"Running {test_file.name} in isolated environment with deps: {deps}")
+                    
+                    isolation_manager = TestIsolationManager(self.repo_root)
+                    if isolation_manager.create_isolated_env(deps):
+                        success, output = isolation_manager.run_test_in_isolation(test_file)
+                        isolation_manager.cleanup()
+                        
+                        if success:
+                            LOGGER.info("Isolated property test passed")
+                        else:
+                            LOGGER.warning(f"Isolated property test failed: {output[:200]}...")
+                        
+                        return success, output, False
+                    else:
+                        LOGGER.warning("Failed to create isolated environment, falling back to normal execution")
+                        
+                except Exception as e:
+                    LOGGER.warning(f"Isolation failed: {e}, falling back to normal execution")
+        
+        # Normal execution
         command = ["pytest", "-q", *[str(path) for path in files]]
         LOGGER.info(
             "Executando pytest para propriedades (%d arquivo[s]): %s",
