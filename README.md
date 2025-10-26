@@ -47,33 +47,98 @@ PR_BUILDER ← LOT_GATE ← SONAR_RESCAN ← TESTS ← PATCH ← FIX_PLAN
 ```
 .
 ├─ app/
-│  ├─ main.py                 # Orquestrador LangGraph
-│  ├─ sonarqube_client.py     # Cliente REST SonarQube
-│  ├─ patcher.py              # Aplicação segura de patches
-│  ├─ utils.py                # Utilitários (scanner, git, masking)
-│  ├─ llm_client.py           # Abstração LLM (OpenAI/local)
-│  ├─ rag/
-│  │  ├─ ingest.py            # Indexação ChromaDB
-│  │  └─ retriever.py         # Retrieval híbrido
-│  └─ a2a/
-│     ├─ protocol.py          # AgentState e tipos
-│     ├─ property_agent.py    # PROP_SPEC/PROP_GEN
-│     ├─ tester_agent.py      # PROP_RUN/TESTS + coverage
-│     ├─ fixer_agent.py       # FIX_PLAN/PATCH
-│     └─ requester_agent.py   # Contexto (legacy)
-├─ src/                        # Código fonte do projeto
-├─ tests/                      # Testes convencionais
-│  ├─ conftest.py             # Config Hypothesis + reports/
-│  └─ test_pipeline_smoke.py  # Smoke tests
-├─ tests_prop/                 # Testes de propriedades (gerados)
-├─ reports/                    # JUnit XML, cobertura
-├─ chroma_db/                  # Base vetorial local
-├─ .coveragerc                 # Config de cobertura
-├─ sonar-project.properties    # Config Sonar + coverage.xml
+│  ├─ __init__.py
+│  ├─ llm_client.py
+│  ├─ logging_setup.py
+│  ├─ main.py
+│  ├─ patcher.py
+│  ├─ codemod_apply.py
+│  ├─ sonarqube_client.py
+│  ├─ utils.py
+│  ├─ a2a/
+│  │  ├─ __init__.py
+│  │  ├─ fixer_agent.py
+│  │  ├─ property_agent.py
+│  │  ├─ protocol.py
+│  │  └─ tester_agent.py
+│  └─ rag/
+│     ├─ ingest.py
+│     └─ retriever.py
+├─ artifacts/
+├─ chroma_db/
+├─ logs/
+│  └─ pipeline.jsonl
+├─ reports/
+├─ tests/
+│  ├─ conftest.py
+│  └─ test_pipeline_smoke.py
+├─ tests_prop/
+│  ├─ __init__.py
+│  ├─ test_database_props.py
+│  └─ test_utils_props.py
 ├─ .github/workflows/autofix.yml
+├─ .coveragerc
+├─ .env
 ├─ .env.example
-└─ README.md
+├─ .gitignore
+├─ LICENSE
+├─ README.md
+├─ requirements.txt
+├─ sonar-project.properties
+└─ test_pipeline.py
 ```
+
+## Inventário de Arquivos
+
+### Raiz
+- `README.md`: Documentação principal do pipeline AutoFix.
+- `requirements.txt`: Lista dependências de LangGraph, RAG, Hypothesis, cobertura e cliente OpenAI.
+- `.env.example`: Template de variáveis sensíveis; copie para `.env` e preencha credenciais locais.
+- `.env`: Configuração local (não deve ser versionada) com tokens para SonarQube, OpenAI e ajustes da pipeline.
+- `.gitignore`: Mantém caches, ambientes virtuais, relatórios e artefatos fora do Git.
+- `.coveragerc`: Configura coleta de cobertura usada por pytest/coverage.
+- `sonar-project.properties`: Define chaves de projeto, fontes (`src`) e testes (`tests`) para o sonar-scanner.
+- `test_pipeline.py`: Script interativo que instância `AutoFixPipeline`, executa o fluxo completo e exibe logs ricos.
+- `LICENSE`: Licença MIT do projeto.
+
+### Diretórios de suporte
+- `artifacts/`: Saídas das execuções (prompts/diffs, issues normalizados, bundles zip). Cada run gera um UUID próprio.
+- `chroma_db/`: Persistência local do índice vetorial utilizado pelo RAG (`chromadb.PersistentClient`).
+- `logs/pipeline.jsonl`: Log estruturado (JSONL) gerado pelo `logging_setup` com contexto de spans.
+- `reports/`: Pasta de destino para `coverage.xml`, `reports/junit*.xml` e demais relatórios de teste (criada sob demanda).
+- `.github/workflows/autofix.yml`: Workflow GitHub Actions que replica o pipeline com Sonar, RAG e agentes.
+- `.pytest_cache/`, `__pycache__/`, `.venv/`: Artefatos de ambiente/teste mantidos fora do controle de versão por `.gitignore`.
+
+### app/
+- `app/main.py`: Orquestra a LangGraph `StateGraph`, conecta agentes, executa nós `SONAR_INGEST` → `PR_BUILDER` e agrupa lotes.
+- `app/logging_setup.py`: Configura logging estruturado, MDC (`set_ctx`), formatação JSON e gestão de artefatos.
+- `app/codemod_apply.py`: Aplicador determinístico de specs JSON (LibCST) que reescreve funções com segurança.
+- `app/llm_client.py`: Abstração de cliente LLM (OpenAI ou compatível) com logging de prompts/respostas e amostragem.
+- `app/patcher.py`: Implementa `SafePatcher`, valida diffs (allowlist, orçamento de LOC, `git apply`) antes de mutar arquivos.
+- `app/sonarqube_client.py`: Cliente REST simples para listar issues e quality gate usando `requests.Session`.
+- `app/utils.py`: Utilitários (masking de segredos, `run_sonar_scanner` com fallback Docker, helpers git).
+- `app/__init__.py`: Exporta símbolos principais do pacote `app`.
+
+### app/a2a
+- `app/a2a/protocol.py`: Define `AgentState` (Pydantic) e `A2AMessage`, núcleo do estado compartilhado.
+- `app/a2a/property_agent.py`: Gera especificações e arquivos de testes Hypothesis usando LLM + RAG, com validações robustas de JSON.
+- `app/a2a/tester_agent.py`: Executa `pytest` (isolado ou Docker), produz `junit.xml`, `coverage.xml` e extrai contraexemplos.
+- `app/a2a/fixer_agent.py`: Monta planos determinísticos, gera diffs unificados e aplica heurísticas AST/LLM para correção.
+- `app/a2a/__init__.py`: Facilita importação dos agentes e do estado.
+
+### app/rag
+- `app/rag/ingest.py`: Indexa diretórios (code/docs) no ChromaDB, com LangChain quando disponível.
+- `app/rag/retriever.py`: Consulta híbrida do índice (`contexts`, `citations`, few-shots) para enriquecer agentes.
+
+### Testes
+- `tests/conftest.py`: Ajusta Hypothesis (perfil sem limite de deadline), garante `reports/` e injeta paths no `sys.path`.
+- `tests/test_pipeline_smoke.py`: Smoke tests de LangGraph, `AgentState` e interações básicas do `PropertyAgent`.
+- `tests/test_codemod_apply.py`: Garante que o spec JSON aplica transformações em AST e valida casos inválidos.
+
+### Testes de propriedades
+- `tests_prop/__init__.py`: Marca pacote de propriedades.
+- `tests_prop/test_database_props.py`: Template Hypothesis para módulos de banco (`test_no_exception_on_valid_input`, etc.).
+- `tests_prop/test_utils_props.py`: Template Hypothesis aplicado a utilidades, pronto para customização.
 
 ## Pré-requisitos
 

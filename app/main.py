@@ -167,7 +167,7 @@ class AutoFixPipeline:
         """Group issues into lots by rule and directory."""
         set_ctx(node="PLAN")
         
-        issues = state.issues
+        issues = self._dedupe_issues(state.issues)
         lots = {}
         
         for issue in issues:
@@ -201,6 +201,7 @@ class AutoFixPipeline:
                  lots=[{"rule": lot["ruleKey"], "dir": lot["directory"], "count": len(lot["issues"])} for lot in lots_list])
         
         return {
+            "issues": issues,
             "lots": lots_list,
             "lot_index": 0,
             "current_lot": lots_list[0] if lots_list else None
@@ -286,8 +287,17 @@ class AutoFixPipeline:
                     "patch_reason": result.get("reason", "unknown")
                 }
         else:
-            logger.error("No patch generated")
-            return {"patch_diff": "", "patch_applied": False, "patch_error": "No patch generated"}
+            last_resp = (self.fixer_agent.last_llm_response or "").strip()
+            if last_resp:
+                logger.error("No patch generated; last LLM response:\n%s", last_resp)
+            else:
+                logger.error("No patch generated; last LLM response was empty.")
+            return {
+                "patch_diff": "",
+                "patch_applied": False,
+                "patch_error": "No patch generated",
+                "patch_llm_response": last_resp,
+            }
     
     def tests(self, state: AgentState) -> Dict[str, Any]:
         """Run full test suite with coverage."""
@@ -335,31 +345,77 @@ class AutoFixPipeline:
             )
             
             # Get fresh issues (OPEN status only)
-            fresh_issues = self.sonar_client.list_issues(state.project_key, status="OPEN")
+            fresh_raw = self.sonar_client.list_issues(state.project_key, status="OPEN")
+            fresh_issues = self._dedupe_issues(fresh_raw)
+            normalized_fresh = [
+                self._normalize_issue(issue, state.repo_path) for issue in fresh_issues
+            ]
             
-            # Filter issues for current lot
+            # Build lots keyed by rule/directory with existing budgets preserved
+            existing_budgets = {
+                f"{lot['ruleKey']}#{lot['directory']}": lot.get("budget", 300)
+                for lot in (state.lots or [])
+            }
+            
+            lots_by_key: Dict[str, Dict[str, Any]] = {}
+            for issue in normalized_fresh:
+                rule_key = issue.get("rule", "unknown")
+                component = issue.get("component", "")
+                directory = str(Path(component).parent) if component else "."
+                lot_key = f"{rule_key}#{directory}"
+                lot_entry = lots_by_key.setdefault(
+                    lot_key,
+                    {
+                        "ruleKey": rule_key,
+                        "directory": directory,
+                        "issues": [],
+                        "budget": existing_budgets.get(lot_key, 300),
+                    },
+                )
+                lot_entry["issues"].append(issue)
+            
+            ordered_keys = [
+                f"{lot['ruleKey']}#{lot['directory']}" for lot in (state.lots or [])
+            ]
+            new_lots: List[Dict[str, Any]] = []
+            for key in ordered_keys:
+                if key in lots_by_key:
+                    new_lots.append(lots_by_key.pop(key))
+            new_lots.extend(lots_by_key.values())
+            
+            updated_current_lot = None
             if state.current_lot:
-                rule = state.current_lot["ruleKey"]
-                target_dir = state.current_lot["directory"]
-                lot_issues = [
-                    i for i in fresh_issues
-                    if i.get("rule") == rule 
-                    and target_dir in i.get("component", "")
-                    and i.get("status") == "OPEN"
-                ]
+                current_key = f"{state.current_lot.get('ruleKey')}#{state.current_lot.get('directory')}"
+                for lot in new_lots:
+                    lot_key = f"{lot.get('ruleKey')}#{lot.get('directory')}"
+                    if lot_key == current_key:
+                        updated_current_lot = lot
+                        break
+                if updated_current_lot is None:
+                    # Lot resolved; keep metadata but drop issues
+                    updated_current_lot = dict(state.current_lot)
+                    updated_current_lot["issues"] = []
             else:
-                lot_issues = []
+                updated_current_lot = None
+            
+            lot_issues = updated_current_lot.get("issues", []) if updated_current_lot else []
             
             # Check quality gate
             qg = self.sonar_client.quality_gate(state.project_key)
             
-            return {
+            payload: Dict[str, Any] = {
                 "sonar_rescan": {
                     "quality_gate": qg.get("projectStatus", {}).get("status", "ERROR"),
                     "lot_clean": len(lot_issues) == 0,
-                    "total_issues": len(fresh_issues)
+                    "total_issues": len(normalized_fresh)
                 }
             }
+            payload["issues"] = normalized_fresh
+            payload["lots"] = new_lots
+            if updated_current_lot is not None:
+                payload["current_lot"] = updated_current_lot
+            
+            return payload
             
         except Exception as e:
             logger.error(f"Sonar rescan failed: {e}")
@@ -410,6 +466,7 @@ class AutoFixPipeline:
     def _create_pr(self, state: AgentState) -> Dict[str, Any]:
         """Create a real pull request using git and gh CLI."""
         import hashlib
+        import uuid
         from .utils import run_cmd
         
         lot = state.current_lot
@@ -423,6 +480,13 @@ class AutoFixPipeline:
         branch = f'fix/sonar-{rule_key.lower().replace(":", "-")}-{suffix}'
         
         repo_path = state.repo_path
+
+        # Ensure branch name is unique per run
+        exists = run_cmd(["git", "rev-parse", "--verify", "--quiet", branch], workdir=repo_path)
+        if exists["exit_code"] == 0:
+            unique_suffix = uuid.uuid4().hex[:6]
+            branch = f"{branch}-{unique_suffix}"
+            logger.info(f"Target branch already exists, using fallback branch {branch}")
         
         # Create and checkout branch
         result = run_cmd(["git", "checkout", "-b", branch], workdir=repo_path)
@@ -534,6 +598,31 @@ This PR automatically fixes SonarQube violations for rule `{rule_key}` in the `{
         issue["dir"] = directory
         
         return issue
+    
+    def _issue_stable_key(self, issue: Dict[str, Any]) -> str:
+        """Build a stable identifier for deduplicating Sonar issues."""
+        rule = issue.get("rule") or issue.get("ruleKey") or ""
+        component = issue.get("component", "")
+        line = (
+            issue.get("textRange", {}).get("startLine")
+            or issue.get("line")
+            or 0
+        )
+        message = issue.get("message", "")
+        message_hash = hashlib.sha1(message.encode("utf-8")).hexdigest()[:8] if message else "nomsg"
+        return f"{rule}:{component}:{line}:{message_hash}"
+    
+    def _dedupe_issues(self, issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove duplicate issues based on a stable key."""
+        seen: set[str] = set()
+        deduped: List[Dict[str, Any]] = []
+        for issue in issues or []:
+            key = self._issue_stable_key(issue)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(issue)
+        return deduped
     
     def update_lot(self, state: AgentState) -> Dict[str, Any]:
         """Update to next lot."""

@@ -172,7 +172,10 @@ def save_artifact(run_dir: str, name: str, content: str) -> str:
 def log_event(event: str, **kw):
     """Log structured event with extra fields."""
     logger = logging.getLogger("app")
-    logger.info(event, extra={"extra": kw})
+    if kw:
+        logger.info("%s %s", event, kw, extra={"extra": kw})
+    else:
+        logger.info(event, extra={"extra": kw})
 
 
 def build_debug_bundle(run_id: str) -> str:
