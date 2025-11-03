@@ -16,7 +16,6 @@ class AgentState(BaseModel):
     max_rounds: int = 3
     current_round: int = 0
     lot_index: int = 0
-    next_action: Optional[str] = None  # "retry" | "next_lot" | "finish"
     
     # Pipeline data
     issues: List[Dict[str, Any]] = []
@@ -36,6 +35,10 @@ class AgentState(BaseModel):
     
     # Flow control
     next_action: str = "continue"  # "retry", "next_lot", "finish"
+    fallback_tried: bool = False
+    prev_issue_hash: str = ""
+    attempts_same_issues: int = 0
+    lot_start_time: Optional[float] = None
     
     # Feedback loop
     feedback: List[str] = []

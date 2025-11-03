@@ -50,11 +50,31 @@ class PropertyAgent:
         if not issues:
             return {"invariants": [], "metamorphisms": [], "oracles": []}
         
-        # Get RAG context for the rule
-        rag_ctx = self.retriever.retrieve(f"sonar rule {rule_key} property testing")
+        repo_path = state.get("repo_path", ".")
+        
+        rag_ctx = dict(state.get("rag_ctx") or {})
+        if not rag_ctx:
+            rag_ctx = self.retriever.retrieve(
+                f"sonar rule {rule_key} property testing",
+                k=6,
+                repo_root=repo_path,
+            )
+        
+        if issues and not rag_ctx.get("code_chunks"):
+            component = issues[0].get("component", "")
+            file_path = self._resolve_component_path(repo_path, component)
+            rel_path = os.path.relpath(file_path, repo_path) if os.path.exists(file_path) else component.split(":", 1)[-1]
+            line = issues[0].get("line") or issues[0].get("textRange", {}).get("startLine")
+            code_chunks = self.retriever.code_chunks(
+                rel_path,
+                repo_root=repo_path,
+                line=line,
+                limit=3,
+            )
+            if code_chunks:
+                rag_ctx["code_chunks"] = code_chunks
         
         # Build prompt for property specification
-        repo_path = state.get("repo_path", ".")
         prompt = self._build_prop_spec_prompt(rule_key, issues, rag_ctx, repo_path)
         
         try:
@@ -197,16 +217,17 @@ class PropertyAgent:
         if not current_lot or not current_lot.get("issues"):
             return {"test_files": [], "generated": 0}
         
-        # Get first issue to determine file path
-        first_issue = current_lot["issues"][0]
-        component = first_issue.get("component", "")
-        
-        if not component.endswith(".py"):
-            return {"test_files": [], "generated": 0}
-        
-        # Resolve file path
+        # Determine target file (lot already groups by function)
         repo_path = state.get("repo_path", ".")
-        file_path = self._resolve_component_path(repo_path, component)
+        lot_file = current_lot.get("file")
+        if lot_file:
+            file_path = Path(repo_path) / lot_file
+        else:
+            first_issue = current_lot["issues"][0]
+            component = first_issue.get("component", "")
+            if not component.endswith(".py"):
+                return {"test_files": [], "generated": 0}
+            file_path = self._resolve_component_path(repo_path, component)
         
         if not os.path.exists(file_path):
             logging.getLogger(__name__).warning(f"File not found: {file_path}")
@@ -214,6 +235,14 @@ class PropertyAgent:
         
         # Extract targets from file
         targets = self._extract_targets(file_path)
+        rag_ctx = state.get("rag_ctx") or {}
+        allowed_symbols = {
+            (chunk.get("symbol") or "").split(".")[-1]
+            for chunk in (rag_ctx.get("code_chunks") or [])
+            if chunk.get("symbol")
+        }
+        if allowed_symbols:
+            targets = [target for target in targets if target.get("name") in allowed_symbols]
         
         test_files = []
         for target in targets[:3]:  # Limit to 3 functions
@@ -234,6 +263,12 @@ class PropertyAgent:
     def _build_prop_spec_prompt(self, rule_key: str, issues: List[Dict], rag_ctx: Dict, repo_path: str = ".") -> str:
         """Build prompt for property specification."""
         contexts = "\n".join(rag_ctx.get("contexts", [])[:3])
+        code_chunks = rag_ctx.get("code_chunks") or []
+        indexed_code = "\n\n".join(
+            f"# {chunk.get('source')}:{chunk.get('start_line')}-{chunk.get('end_line')} ({chunk.get('symbol')})\n{chunk.get('content')}"
+            for chunk in code_chunks[:3]
+            if chunk.get("content")
+        )
         
         # Extract code snippet from first issue
         code_snippet = ""
@@ -286,11 +321,21 @@ class PropertyAgent:
   }
 ]'''
         
+        # Extract target function name from issues
+        target_func = None
+        for issue in issues or []:
+            func_name = issue.get("function")
+            if func_name and func_name != "__module__":
+                target_func = func_name
+                break
+        
         # Dynamic part (can use f-string)
+        target_hint = f"\n\n**🎯 TARGET FUNCTION: {target_func}**" if target_func else ""
+        
         header = dedent(f"""You are a software engineer specializing in generating property-based tests using Hypothesis for Python.
 
 ## Goal:
-Given the code and the issue description (e.g. from SonarQube), identify testable properties that describe the expected behavior of the function. These properties will guide test generation and help detect bugs.
+Generate property-based tests for the SPECIFIC function mentioned in the issue.{target_hint}
 
 ---
 
@@ -312,6 +357,12 @@ Given the code and the issue description (e.g. from SonarQube), identify testabl
 
 ---
 
+## Relevant Code Snippets (indexed via RAG):
+
+{indexed_code or "(not available)"}
+
+---
+
 ## Previous Examples (few-shot property-based tests):
 
 {few_shots}
@@ -320,13 +371,12 @@ Given the code and the issue description (e.g. from SonarQube), identify testabl
 
 ## Instructions:
 
-1. Carefully analyze the function and issue.
-2. Issue type is {issue_type}. For BUG/VULNERABILITY, properties are MANDATORY and should be strict. For CODE_SMELL, properties can be more lenient.
-3. Identify up to 3 relevant **properties** that:
-   - Describe behavior for valid input (✅ invariants)
-   - Compare inputs/outputs with transformations (🔁 metamorphic relations)
-   - Expect errors on invalid inputs (💥 oracles)
-4. For each property, include:
+1. Focus ONLY on the function: {target_func or 'the function mentioned in the issue'}
+2. IGNORE other functions in the code context (like divide_numbers, etc.)
+3. Issue type is {issue_type}. For BUG/VULNERABILITY, properties are MANDATORY and should be strict. For CODE_SMELL, properties can be more lenient.
+4. Generate 2-4 property-based test specifications for {target_func or 'the target function'}
+5. Each property should test a behavioral aspect of {target_func or 'the target function'}
+6. For each property, include:
    - `name`: short identifier
    - `type`: one of ["invariant", "metamorphic", "oracle"]
    - `description`: human-readable summary
@@ -336,19 +386,20 @@ Given the code and the issue description (e.g. from SonarQube), identify testabl
 ---""")
         
         # Static part with JSON example — NO f-string here!
-        json_guide = dedent("""## Response Format (JSON ONLY — no prose, no markdown)
-Return ONLY a JSON array **between the markers** below:
+        func_example = target_func or "target_function"
+        json_guide = f"""## Response Format (JSON ONLY — no prose, no markdown)
+Return ONLY a JSON array for {func_example} **between the markers** below:
 <<JSON>>
 [
-  {
-    "name": "preserve_length",
+  {{
+    "name": "{func_example}_returns_list",
     "type": "invariant",
-    "description": "The function must return a list of the same length as the input.",
-    "domain": "non-empty list of integers",
-    "fallback": "Return an empty list if input is invalid"
-  }
+    "description": "The {func_example} function must return a list.",
+    "domain": "valid filename strings",
+    "fallback": "Return empty list if file cannot be processed"
+  }}
 ]
-<<END_JSON>>""")
+<<END_JSON>>"""
         
         return header + "\n" + json_guide
     

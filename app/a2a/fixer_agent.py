@@ -62,6 +62,113 @@ def _extract_signature_block(func_src: str, func_name: str) -> Tuple[List[str], 
     return decorators, signature_line, base_indent, body_indent
 
 
+def _body_requires_nested_indent(lines: List[str]) -> bool:
+    """Return True if lines contain nested blocks or multiline literals requiring indentation."""
+    bracket_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        open_count = stripped.count("(") + stripped.count("[") + stripped.count("{")
+        close_count = stripped.count(")") + stripped.count("]") + stripped.count("}")
+        bracket_depth = max(bracket_depth + open_count - close_count, 0)
+
+        if stripped.endswith(":"):
+            return True
+        if bracket_depth > 0:
+            return True
+
+    return False
+
+
+def _normalize_indentation(code: str) -> str:
+    """Normalize inconsistent indentation in function code."""
+    import textwrap
+    
+    lines = code.splitlines()
+    if not lines:
+        return code
+    
+    # Find the function definition line
+    func_line_idx = -1
+    for i, line in enumerate(lines):
+        if line.strip().startswith(('def ', 'async def ')):
+            func_line_idx = i
+            break
+    
+    if func_line_idx == -1:
+        return code
+    
+    # Split into header (decorators + def) and body
+    header_lines = lines[:func_line_idx + 1]
+    body_lines = lines[func_line_idx + 1:]
+    
+    if not body_lines:
+        return code
+    
+    # Get function definition indentation
+    func_line = lines[func_line_idx]
+    base_indent = len(func_line) - len(func_line.lstrip())
+    
+    # Process body lines while preserving relative indentation
+    stripped_lines = [line for line in body_lines if line.strip()]
+    if not stripped_lines:
+        reindented_body = " " * (base_indent + 4) + "pass"
+    else:
+        target_base_indent = base_indent + 4
+        
+        # Use textwrap.dedent more carefully
+        body_text = "\n".join(body_lines)
+        try:
+            dedented = textwrap.dedent(body_text)
+            dedented_body_lines = dedented.splitlines()
+        except Exception:
+            # Fallback: manual dedent
+            min_indent = min(len(line) - len(line.lstrip()) 
+                           for line in body_lines if line.strip())
+            dedented_body_lines = [line[min_indent:] if len(line) > min_indent else line 
+                                 for line in body_lines]
+        
+        needs_nested_indent = _body_requires_nested_indent(dedented_body_lines)
+        reindented_lines: List[str] = []
+        for dedented_line in dedented_body_lines:
+            stripped = dedented_line.strip()
+            if not stripped:
+                reindented_lines.append("")
+                continue
+
+            relative_indent = len(dedented_line) - len(dedented_line.lstrip())
+            if not needs_nested_indent:
+                relative_indent = 0
+            else:
+                # Ensure consistent 4-space indentation
+                relative_indent = (relative_indent // 4) * 4
+            new_indent = target_base_indent + relative_indent
+            reindented_lines.append(" " * new_indent + stripped.rstrip())
+
+        reindented_body = "\n".join(reindented_lines)
+    
+    # Combine header and normalized body
+    if reindented_body:
+        result = "\n".join(header_lines) + "\n" + reindented_body.rstrip()
+    else:
+        result = "\n".join(header_lines) + "\n" + " " * (base_indent + 4) + "pass"
+    
+    # Validate the result more thoroughly
+    try:
+        # Test both standalone and in class context
+        ast.parse(result)
+        class_test = f"class Test:\n{textwrap.indent(result, '    ')}"
+        ast.parse(class_test)
+        return result
+    except SyntaxError as e:
+        print(f"Normalization validation failed: {e}")
+        print(f"Problematic result:\n{result}")
+        # Return original if normalization breaks syntax
+        return code
+
+
 def _extract_func_from_llm(txt: str, func_name: str, original_src: str | None = None) -> str:
     """Extract function from LLM response with multiple fallbacks."""
     original_text = txt.strip()
@@ -90,6 +197,16 @@ def _extract_func_from_llm(txt: str, func_name: str, original_src: str | None = 
 
     pattern = rf"^\s*(?:async\s+)?def\s+{re.escape(func_name)}\s*\("
     if re.search(pattern, cand, re.MULTILINE):
+        # Normalize indentation and validate syntax
+        normalized = _normalize_indentation(cand)
+        try:
+            import ast
+            ast.parse(normalized)  # Validate syntax
+            cand = normalized
+        except SyntaxError as e:
+            print(f"Indentation normalization failed, using original: {e}")
+            # Keep original if normalization breaks syntax
+        
         cand = cand.rstrip()
         return cand + ("\n" if not cand.endswith("\n") else "")
 
@@ -102,9 +219,29 @@ def _extract_func_from_llm(txt: str, func_name: str, original_src: str | None = 
     if not body_text:
         body_text = "pass"
 
-    dedented_body = textwrap.dedent(body_text).rstrip()
+    raw_lines = body_text.splitlines()
+    adjusted_body_text = body_text
+    if raw_lines:
+        first_line = raw_lines[0]
+        first_indent = len(first_line) - len(first_line.lstrip())
+        other_indents = [len(line) - len(line.lstrip()) for line in raw_lines[1:] if line.strip()]
+        if first_indent == 0 and other_indents:
+            pad = min(other_indents)
+            if pad > 0:
+                adjusted_lines = [" " * pad + raw_lines[0]] + raw_lines[1:]
+                adjusted_body_text = "\n".join(adjusted_lines)
+
+    dedented_body = textwrap.dedent(adjusted_body_text).rstrip()
     if not dedented_body:
         dedented_body = "pass"
+
+    lines = dedented_body.splitlines()
+    if lines:
+        if _body_requires_nested_indent(lines):
+            cleaned_lines = [line.rstrip() for line in lines]
+        else:
+            cleaned_lines = [line.strip() for line in lines]
+        dedented_body = "\n".join(cleaned_lines)
 
     dedented_body += "\n"
     indented_body = textwrap.indent(dedented_body, body_indent)
@@ -325,11 +462,17 @@ class FixerAgent:
             logger.error(f"Error reading target file {target_file}: {e}")
             return ""
 
+        issues_for_file = self._issues_for_file(current_lot.get("issues", []), target_file)
+        prompt_contents: Dict[str, str] = {
+            target_file: self._annotate_text_section(content, issues_for_file, base_index=0)
+        }
+
         # 1) Primary path: semantic codemod spec
         try:
             spec_patch = self._try_semantic_codemod(
                 target,
                 file_contents,
+                prompt_contents,
                 repo_root,
                 budget,
                 current_lot,
@@ -344,7 +487,12 @@ class FixerAgent:
 
         # 2) Function-level rewrite with AST swap
         if target.get("func_name"):
-            func_patch = self._try_function_rewrite_target(target, file_contents, repo_root)
+            func_patch = self._try_function_rewrite_target(
+                target,
+                file_contents,
+                repo_root,
+                issues_for_file,
+            )
             if func_patch:
                 error = self._enforce_allowlist_and_budget(func_patch, budget, current_lot)
                 if error:
@@ -368,6 +516,7 @@ class FixerAgent:
         self,
         target: Dict[str, Any],
         file_contents: Dict[str, str],
+        prompt_contents: Dict[str, str],
         repo_root: str,
         budget: int,
         current_lot: Dict[str, Any],
@@ -375,7 +524,15 @@ class FixerAgent:
         rule_key: str,
     ) -> str:
         """Attempt to build a diff from a semantic codemod spec."""
-        prompt = self._build_spec_prompt(target, file_contents, rag_ctx, rule_key)
+        issues_for_target = self._issues_for_file(current_lot.get("issues", []), target.get("file", ""))
+        prompt = self._build_spec_prompt(
+            target,
+            file_contents,
+            rag_ctx,
+            rule_key,
+            prompt_contents.get(target["file"]),
+            issues_for_target,
+        )
         response = self._llm_generate(
             prompt=prompt,
             max_tokens=800,
@@ -463,18 +620,33 @@ class FixerAgent:
         file_contents: Dict[str, str],
         rag_ctx: Dict[str, Any],
         rule_key: str,
+        prompt_override: str | None = None,
+        issues: list[Dict[str, Any]] | None = None,
     ) -> str:
         """Build prompt requesting a JSON spec for deterministic codemod."""
         file_path = target["file"]
         func_name = target.get("func_name", "unknown")
-        content = file_contents.get(file_path, "")
+        content = prompt_override if prompt_override is not None else file_contents.get(file_path, "")
 
         if len(content) > 2400:
             content = content[:2400] + "\n# … truncated for prompt"
 
         few_shots = rag_ctx.get("few_shots", [])
         contexts = rag_ctx.get("contexts", [])
+        code_chunks = rag_ctx.get("code_chunks") or []
         examples = "\n\n".join(few_shots[:2]) if few_shots else "\n".join(contexts[:1])
+        code_examples = "\n\n".join(
+            f"# {chunk.get('source')}:{chunk.get('start_line')}-{chunk.get('end_line')} ({chunk.get('symbol')})\n{chunk.get('content')}"
+            for chunk in code_chunks[:2]
+            if chunk.get("content")
+        )
+        markers_hint = ""
+        if issues:
+            unique_markers = {
+                self._make_issue_marker(issue) for issue in issues if self._issue_line(issue) is not None
+            }
+            if unique_markers:
+                markers_hint = "\n".join(sorted(unique_markers))
 
         spec_schema = json.dumps(
             {
@@ -484,9 +656,9 @@ class FixerAgent:
                         "operations": [
                             {
                                 "type": "replace_function",
-                                "name": func_name,
-                                "signature": "def sample(arg):",
-                                "decorators": ["@example"],
+                                "name": func_name or "target_function",
+                                "signature": f"def {func_name or 'target_function'}(self, arg):",
+                                "decorators": [],
                                 "body": [
                                     "if condition:",
                                     "    return value",
@@ -516,15 +688,24 @@ Current file content (read-only):
 Reference fixes / guidance:
 {examples or '(none)'}
 
+Repository snippets near the issue:
+{code_examples or '(none)'}
+
+Active issue markers (# <<<AUTOFIX ISSUE:...>>>):
+{markers_hint or '(markers embedded above)'}
+
 Schema (example values, keep same structure):
 {spec_schema}
 
 Rules:
 - Output valid JSON matching the schema above (list of files → operations).
 - Use operation type "replace_function" and provide the exact `signature`, optional `decorators`, and a `body` list with each statement as a string.
+- The "name" field MUST be a valid Python function name (not null, not empty).
 - Keep imports/decorators intact unless they violate the rule. Preserve the existing signature unless a change is required by the rule.
 - Limit modifications to the target file only.
 - Do not include markdown fences, commentary or explanatory text.
+- Remove any injected markers (`# <<<AUTOFIX ISSUE:...>>>`) from the final code.
+- Ensure all function names are valid Python identifiers.
 
 Finish the response with the sentinel on a separate line: {sentinel}
 If no change is needed return: {{"files": []}}
@@ -552,7 +733,28 @@ Do not output anything after the sentinel."""
             try:
                 data = json.loads(candidate)
                 if isinstance(data, dict) and "files" in data:
-                    return data
+                    # Validate operations have valid names
+                    valid_data = {"files": []}
+                    for file_entry in data.get("files", []):
+                        if not isinstance(file_entry, dict):
+                            continue
+                        valid_ops = []
+                        for op in file_entry.get("operations", []):
+                            if not isinstance(op, dict):
+                                continue
+                            name = op.get("name")
+                            # Skip operations with invalid names
+                            if (name and 
+                                str(name).lower() != "null" and 
+                                str(name) != "None" and
+                                str(name).strip() and
+                                str(name).isidentifier()):
+                                valid_ops.append(op)
+                        if valid_ops:
+                            file_entry["operations"] = valid_ops
+                            valid_data["files"].append(file_entry)
+                    if valid_data["files"]:
+                        return valid_data
             except json.JSONDecodeError:
                 continue
 
@@ -641,6 +843,76 @@ Do not output anything after the sentinel."""
             return ""  # No errors
         except Exception as e:
             return f"Patch validation failed: {e}"
+    
+    def _issues_for_file(self, issues: list[Dict[str, Any]], file_path: str) -> list[Dict[str, Any]]:
+        """Filter issues that belong to the given relative file path."""
+        norm_target = self._component_rel(file_path)
+        if norm_target.startswith("./"):
+            norm_target = norm_target[2:]
+        norm_target = Path(norm_target).as_posix()
+        matched: list[Dict[str, Any]] = []
+        for issue in issues or []:
+            comp_rel = issue.get("component_rel") or issue.get("component", "")
+            if comp_rel.startswith("tokens:"):
+                comp_rel = comp_rel.split(":", 1)[-1]
+            comp_rel = comp_rel.lstrip("./")
+            comp_rel = Path(comp_rel).as_posix()
+            if comp_rel == norm_target:
+                matched.append(issue)
+        return matched
+    
+    def _issue_line(self, issue: Dict[str, Any]) -> int | None:
+        """Extract 1-based line number for an issue."""
+        line = issue.get("line")
+        if isinstance(line, int):
+            return line
+        text_range = issue.get("textRange") or {}
+        line = text_range.get("startLine")
+        return int(line) if isinstance(line, int) else None
+    
+    def _make_issue_marker(self, issue: Dict[str, Any]) -> str:
+        """Build synthetic marker comment for a given issue."""
+        import re
+        rule = issue.get("ruleKey") or issue.get("rule") or "UNKNOWN_RULE"
+        message = issue.get("message", "") or ""
+        summary = message.splitlines()[0] if message else ""
+        summary = re.sub(r"\s+", " ", summary).strip()
+        if len(summary) > 72:
+            summary = summary[:69] + "..."
+        return f"# <<<AUTOFIX ISSUE:{rule}|{summary}>>>"
+    
+    def _annotate_text_section(
+        self,
+        text: str,
+        issues: list[Dict[str, Any]],
+        *,
+        base_index: int = 0
+    ) -> str:
+        """Inject issue markers into a text section using global line offsets."""
+        if not issues:
+            return text
+        markers: Dict[int, list[str]] = {}
+        last_line_index = len(text.splitlines())
+        for issue in issues:
+            line = self._issue_line(issue)
+            if line is None:
+                continue
+            zero_based = max(line - 1, 0)
+            rel = zero_based - base_index
+            if rel < 0 or rel > last_line_index:
+                continue
+            markers.setdefault(rel, []).append(self._make_issue_marker(issue))
+        lines = text.splitlines(True)
+        annotated: list[str] = []
+        for idx, line_text in enumerate(lines):
+            for marker in markers.get(idx, []):
+                annotated.append(marker + ("\n" if not marker.endswith("\n") else ""))
+            annotated.append(line_text)
+        for marker in markers.get(len(lines), []):
+            annotated.append(marker + ("\n" if not marker.endswith("\n") else ""))
+        if annotated and not annotated[-1].endswith("\n"):
+            annotated[-1] = annotated[-1] + "\n"
+        return "".join(annotated)
     
     def _fallback_codemod(self, file_path: str, rule_key: str) -> str:
         """Apply mechanical refactoring for common patterns."""
@@ -783,6 +1055,21 @@ Do not output anything after the sentinel."""
         new_func_src: str,
     ) -> str:
         """Apply function replacement via LibCST spec."""
+        # Validate new function syntax before attempting LibCST
+        try:
+            import ast
+            # Test both dedented and original versions
+            test_code = textwrap.dedent(new_func_src)
+            ast.parse(test_code)
+            
+            # Also test if it would fit in a class context
+            class_test = f"class Test:\n{textwrap.indent(test_code, '    ')}"
+            ast.parse(class_test)
+        except SyntaxError as e:
+            print(f"Function swap skipped - invalid syntax in {func_name}: {e}")
+            print(f"Problematic code:\n{new_func_src}")
+            return ""
+        
         spec = {
             "files": [
                 {
@@ -816,8 +1103,12 @@ Do not output anything after the sentinel."""
                 raise ValueError(f"unsupported operation type: {op.get('type')}")
 
             func_name = op.get("name")
-            if not func_name:
-                raise ValueError("replace_function operation missing 'name'")
+            if not func_name or func_name == "null" or str(func_name).lower() == "null":
+                raise ValueError(f"replace_function operation missing or invalid 'name': {func_name}")
+            
+            # Validate function name is a valid Python identifier
+            if not str(func_name).isidentifier():
+                raise ValueError(f"replace_function operation has invalid function name: {func_name}")
 
             func_code = op.get("code")
             source = "code"
@@ -904,10 +1195,23 @@ Do not output anything after the sentinel."""
         """Find function enclosing the given line number."""
         try:
             tree = ast.parse(text)
+            lines = text.splitlines()
+            
             for node in ast.walk(tree):
                 if isinstance(node, ast.FunctionDef):
                     s = getattr(node, "lineno", None)
                     e = getattr(node, "end_lineno", None)
+                    
+                    # If end_lineno not available, estimate from next function
+                    if s and not e:
+                        e = len(lines) + 1
+                        for other_node in ast.walk(tree):
+                            if (isinstance(other_node, (ast.FunctionDef, ast.ClassDef)) and 
+                                other_node != node):
+                                other_start = getattr(other_node, "lineno", None)
+                                if other_start and other_start > s:
+                                    e = min(e, other_start)
+                    
                     if s and e and s <= line_no <= e:
                         return node.name, s-1, e  # (name, start 0-based, end)
         except:
@@ -1048,6 +1352,8 @@ Constraints:
 - Same return types/semantics; no I/O (no print/log/input), no new imports/globals, no changes in other functions.
 - Prefer guard-clauses and small local helpers defined inside the function.
 - No placeholders or ellipses (...).
+- Use consistent 4-space indentation for function body.
+- Remove any temporary markers matching `# <<<AUTOFIX ISSUE:...>>>` from the final code.
 
 Context (read-only, do not modify):
 <<CTX>>
@@ -1064,7 +1370,13 @@ Now output ONLY the replacement function body:
 <<FUNC_NEW>>
 {func_sig}""".rstrip()
     
-    def _try_function_rewrite_target(self, target: dict, file_contents: dict, repo_root: str) -> str:
+    def _try_function_rewrite_target(
+        self,
+        target: dict,
+        file_contents: dict,
+        repo_root: str,
+        issues_for_file: list[Dict[str, Any]],
+    ) -> str:
         """Try function-level rewriting with strict validation and retries."""
         if not target.get("func_name") or not target.get("func_span"):
             return ""
@@ -1083,7 +1395,30 @@ Now output ONLY the replacement function body:
         try:
             text = file_contents[file_path]
             lines = text.splitlines(True)
-            func_src = "".join(lines[start:end])
+            
+            # Ensure we capture the complete function by extending end if needed
+            extended_end = end
+            if extended_end < len(lines):
+                # Look ahead to find actual function end
+                for i in range(end, min(len(lines), end + 100)):
+                    line = lines[i].strip()
+                    # Stop at next function/class or significant dedent
+                    if (line.startswith(('def ', 'class ')) or 
+                        (line and not line.startswith(' ') and not line.startswith('#'))):
+                        extended_end = i
+                        break
+                else:
+                    extended_end = min(len(lines), end + 50)
+            
+            func_src = "".join(lines[start:extended_end])
+            window_start = max(0, start - 5)
+            window_end = min(len(lines), extended_end + 5)
+            ctx_slice = "".join(lines[window_start:window_end])
+            ctx_text = self._annotate_text_section(
+                ctx_slice,
+                issues_for_file,
+                base_index=window_start,
+            )
 
             expected_hash = target.get("func_hash")
             current_hash = self._hash_text(func_src) if func_src else ""
@@ -1102,8 +1437,6 @@ Now output ONLY the replacement function body:
 
             if func_src:
                 target["func_hash"] = self._hash_text(func_src)
-
-            ctx_text = self._window_lines(text, start, end, k=5)
 
             # Build prompt for function rewrite
             prompt = self._prompt_rewrite_func(target["rule"], func_name, ctx_text, func_src)
@@ -1215,25 +1548,32 @@ Now output ONLY the replacement function body:
         if "..." in text:
             return False, "contains_ellipsis"
 
+        # Check for function signature in response (with or without markers)
+        signature_pattern = rf"^\s*(?:async\s+)?def\s+{re.escape(func_name)}\s*\("
+        has_function = re.search(signature_pattern, text, flags=re.MULTILINE)
+        
+        if not has_function:
+            return False, "missing_signature"
+
+        # Prefer responses with markers, but accept without them
         has_markers = "<<FUNC_NEW>>" in text and (
             "<<END_FUNC>>" in text or "<<END_FUNC_NEW>>" in text
         )
-        if not has_markers:
-            return False, "missing_markers"
-
-        try:
-            inner = text.split("<<FUNC_NEW>>", 1)[1]
-            inner = inner.rsplit("<<END_FUNC", 1)[0]
-        except IndexError:
-            return False, "marker_parse_error"
-
-        signature_pattern = rf"^\s*(?:async\s+)?def\s+{re.escape(func_name)}\s*\("
-        if not re.search(signature_pattern, inner, flags=re.MULTILINE):
-            return False, "missing_signature"
-
-        closing_pattern = r"<<END_FUNC(?:_NEW)?>>\s*$"
-        if not re.search(closing_pattern, text, flags=re.MULTILINE):
-            return False, "missing_closing_marker"
-
+        
+        if has_markers:
+            # Validate marker structure if present
+            try:
+                inner = text.split("<<FUNC_NEW>>", 1)[1]
+                inner = inner.rsplit("<<END_FUNC", 1)[0]
+                if not re.search(signature_pattern, inner, flags=re.MULTILINE):
+                    return False, "invalid_marker_content"
+            except IndexError:
+                return False, "marker_parse_error"
+            
+            closing_pattern = r"<<END_FUNC(?:_NEW)?>>\s*$"
+            if not re.search(closing_pattern, text, flags=re.MULTILINE):
+                return False, "missing_closing_marker"
+        
+        # Accept response if it has valid function, even without markers
         return True, None
     

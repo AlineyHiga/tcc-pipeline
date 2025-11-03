@@ -4,6 +4,7 @@ import logging
 import uuid
 import hashlib
 import json
+import copy
 from pathlib import Path
 from typing import Dict, Any, List
 from dotenv import load_dotenv
@@ -81,13 +82,19 @@ class AutoFixPipeline:
             {
                 "continue": "rule_rag",  # Loop back for refinement
                 "next_lot": "update_lot",  # Update lot then continue
-                "finish": "pr_builder"
+                "finish": "pr_builder",
+                "stop": END,
             }
         )
         workflow.add_edge("update_lot", "rule_rag")
         workflow.add_edge("pr_builder", END)
         
         return workflow.compile()
+    
+    def _issues_hash(self, issues: List[Dict[str, Any]]) -> str:
+        """Create a stable hash for a list of issues."""
+        payload = json.dumps(issues, sort_keys=True, default=str)
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
     
     def run(self) -> Dict[str, Any]:
         """Execute the AutoFix pipeline."""
@@ -111,10 +118,20 @@ class AutoFixPipeline:
         
         try:
             with Span(logger, "pipeline.execute"):
+                recursion_limit = int(os.getenv("GRAPH_RECURSION_LIMIT", "100"))
+                log_event("graph.recursion_limit", recursion_limit=recursion_limit)
+
                 # Execute graph
-                result = self.graph.invoke(initial_state)
+                result = self.graph.invoke(
+                    initial_state,
+                    config={"recursion_limit": recursion_limit}
+                )
             
             pr_count = len(result.get('pr_urls', []))
+            
+            # Gerar resumo final dos lotes
+            self._log_pipeline_summary(result)
+            
             log_event("pipeline.complete", pr_count=pr_count, pr_urls=result.get('pr_urls', []))
             
             return result
@@ -156,15 +173,19 @@ class AutoFixPipeline:
                      normalized_count=len(normalized_issues),
                      artifact_path=issues_path)
             
-            return {"issues": normalized_issues}
+            return {
+                "issues": normalized_issues,
+                "prev_issue_hash": self._issues_hash(normalized_issues),
+                "attempts_same_issues": 0,
+            }
             
         except Exception as e:
             log_event("sonar.ingest.error", error=str(e))
             logger.error(f"SonarQube ingest failed: {e}")
-            return {"issues": []}
+            return {"issues": [], "prev_issue_hash": "", "attempts_same_issues": 0}
     
     def plan(self, state: AgentState) -> Dict[str, Any]:
-        """Group issues into lots by rule and directory."""
+        """Group issues into lots by file and function."""
         set_ctx(node="PLAN")
         
         issues = self._dedupe_issues(state.issues)
@@ -172,39 +193,61 @@ class AutoFixPipeline:
         
         for issue in issues:
             rule_key = issue.get("rule", "unknown")
-            component = issue.get("component", "")
-            directory = str(Path(component).parent) if component else "."
+            component_rel = issue.get("component_rel") or issue.get("component", "")
+            if component_rel.startswith("tokens:"):
+                component_rel = component_rel.split(":", 1)[-1]
+            directory = str(Path(component_rel).parent) if component_rel else "."
+            function_name = issue.get("function") or "__module__"
             
-            lot_key = f"{rule_key}#{directory}"
+            # Agrupar por arquivo+função (sem regra)
+            lot_key = f"{component_rel}#{function_name}"
             
             if lot_key not in lots:
+                # Usar primeira regra encontrada como representativa
                 lots[lot_key] = {
                     "ruleKey": rule_key,
                     "directory": directory,
+                    "file": component_rel,
+                    "function": function_name,
                     "issues": [],
                     "budget": 300  # LOC limit
                 }
             
             lots[lot_key]["issues"].append(issue)
         
-        lots_list = list(lots.values())
+        lots_list = sorted(
+            lots.values(),
+            key=lambda lot: (lot["ruleKey"], lot.get("file", ""), lot.get("function", "")),
+        )
         
         # Set lot_id for first lot
         if lots_list:
             first_lot = lots_list[0]
-            lot_id = hashlib.sha256(f"{first_lot['ruleKey']}:{first_lot['directory']}".encode()).hexdigest()[:8]
+            lot_id = hashlib.sha256(
+                f"{first_lot['ruleKey']}:{first_lot.get('file','')}:{first_lot.get('function','')}".encode()
+            ).hexdigest()[:8]
             set_ctx(lot_id=lot_id)
         
         log_event("plan.complete", 
                  total_issues=len(issues),
                  lots_count=len(lots_list),
-                 lots=[{"rule": lot["ruleKey"], "dir": lot["directory"], "count": len(lot["issues"])} for lot in lots_list])
+                 lots=[
+                     {
+                         "rule": lot["ruleKey"],
+                         "file": lot.get("file", ""),
+                         "func": lot.get("function", ""),
+                         "count": len(lot["issues"])
+                     }
+                     for lot in lots_list
+                 ])
         
+        import time
         return {
             "issues": issues,
             "lots": lots_list,
             "lot_index": 0,
-            "current_lot": lots_list[0] if lots_list else None
+            "current_lot": lots_list[0] if lots_list else None,
+            "lot_start_time": time.time() if lots_list else None
         }
     
     def rule_rag(self, state: AgentState) -> Dict[str, Any]:
@@ -212,18 +255,74 @@ class AutoFixPipeline:
         current_lot = state.current_lot
         if not current_lot:
             return {"rag_ctx": {}}
+        if state.current_round > 0 and state.rag_ctx:
+            logger.info(
+                "Reusing RAG context for retry round %s",
+                state.current_round,
+            )
+            return {"rag_ctx": copy.deepcopy(state.rag_ctx)}
         
         rule_key = current_lot.get("ruleKey", "")
         logger.info(f"Retrieving context for rule {rule_key}")
         
         query = f"sonar rule {rule_key} fix examples"
-        rag_ctx = self.retriever.retrieve(query)
+        rag_ctx = self.retriever.retrieve(query, k=6)
+        
+        repo_root = state.repo_path or "."
+        file_rel = current_lot.get("file")
+        first_issue = (current_lot.get("issues") or [None])[0]
+        issue_line = None
+        if first_issue:
+            issue_line = first_issue.get("line") or first_issue.get("textRange", {}).get("startLine")
+        if file_rel:
+            issue_path = file_rel
+        else:
+            issue_path, issue_line = self._issue_path_and_line(first_issue, repo_root)
+        
+        if issue_path:
+            targeted = self.retriever.retrieve(
+                f"{Path(issue_path).name} {rule_key}",
+                k=4,
+                file_path=issue_path,
+                symbol=current_lot.get("function"),
+                repo_root=repo_root,
+            )
+            rag_ctx = self._merge_rag_context(rag_ctx, targeted)
+            
+            code_chunks = self.retriever.code_chunks(
+                issue_path,
+                repo_root=repo_root,
+                line=issue_line,
+                symbol=current_lot.get("function"),
+                limit=4,
+            )
+            if code_chunks:
+                rag_ctx["code_chunks"] = code_chunks
+                citations = [
+                    f"{chunk['source']}:{chunk['start_line']}-{chunk['end_line']}"
+                    for chunk in code_chunks
+                    if chunk.get("source") and chunk.get("start_line")
+                ]
+                if citations:
+                    rag_ctx.setdefault("citations", [])
+                    for cite in citations:
+                        if cite not in rag_ctx["citations"]:
+                            rag_ctx["citations"].append(cite)
         
         return {"rag_ctx": rag_ctx}
     
     def prop_spec(self, state: AgentState) -> Dict[str, Any]:
         """Generate property specifications."""
         logger.info("Generating property specifications")
+
+        existing_spec = state.prop_spec or {}
+        if state.current_round > 0 and existing_spec:
+            logger.info(
+                "Reusing existing property specifications for retry round %s",
+                state.current_round,
+            )
+            # Return a shallow copy to avoid accidental mutation of state
+            return {"prop_spec": copy.deepcopy(existing_spec)}
         
         prop_spec = self.property_agent.prop_spec(state.model_dump())
         
@@ -232,6 +331,18 @@ class AutoFixPipeline:
     def prop_gen(self, state: AgentState) -> Dict[str, Any]:
         """Generate Hypothesis test files."""
         logger.info("Generating property test files")
+
+        existing_gen = state.prop_gen or {}
+        existing_files = existing_gen.get("test_files") or []
+        if (
+            state.current_round > 0
+            and (existing_files or existing_gen.get("generated") or existing_gen.get("files_generated"))
+        ):
+            logger.info(
+                "Reusing existing property tests for retry round %s (PropertyAgent skipped)",
+                state.current_round,
+            )
+            return {"prop_gen": copy.deepcopy(existing_gen)}
         
         result = self.property_agent.prop_gen(state.model_dump())
         
@@ -259,8 +370,45 @@ class AutoFixPipeline:
         logger.info("Creating fix plan")
         
         fix_plan = self.fixer_agent.fix_plan(state.model_dump())
+        next_action = state.next_action
+        targets = fix_plan.get("targets", []) if isinstance(fix_plan, dict) else []
+        if not targets:
+            logger.warning("Fix plan returned no targets - stopping current lot")
+            next_action = "STOP"
+        else:
+            first = targets[0]
+            if not first.get("func_name"):
+                # Try to recover by re-analyzing the file
+                current_lot = state.current_lot or {}
+                file_path = current_lot.get("file")
+                if file_path:
+                    logger.warning(f"Fix plan target missing function name - attempting recovery for {file_path}")
+                    try:
+                        repo_path = state.repo_path or "."
+                        full_path = Path(repo_path) / file_path
+                        if full_path.exists():
+                            content = full_path.read_text(encoding="utf-8")
+                            # Try to find any function in the file
+                            import ast
+                            tree = ast.parse(content)
+                            functions = [node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]
+                            if functions:
+                                first["func_name"] = functions[0]  # Use first function found
+                                logger.info(f"Recovered function name: {functions[0]}")
+                            else:
+                                logger.warning("No functions found in file - stopping current lot")
+                                next_action = "STOP"
+                        else:
+                            logger.warning(f"File not found: {full_path} - stopping current lot")
+                            next_action = "STOP"
+                    except Exception as e:
+                        logger.error(f"Failed to recover function name: {e} - stopping current lot")
+                        next_action = "STOP"
+                else:
+                    logger.warning("Fix plan target missing function name and file path - stopping current lot")
+                    next_action = "STOP"
         
-        return {"fix_plan": fix_plan}
+        return {"fix_plan": fix_plan, "next_action": next_action}
     
     def patch(self, state: AgentState) -> Dict[str, Any]:
         """Generate and apply patch."""
@@ -277,14 +425,25 @@ class AutoFixPipeline:
             result = self.patcher.apply_patch(patch_diff, state.repo_path, budget=budget)
             if result["applied"]:
                 logger.info(f"Patch applied successfully ({result['files_changed']} files)")
-                return {"patch_diff": patch_diff, "patch_applied": True}
+                return {"patch_diff": patch_diff, "patch_applied": True, "next_action": "continue"}
             else:
                 logger.error(f"Patch failed: {result['error']}")
+                # Log falha do patch
+                current_lot = state.current_lot or {}
+                log_event(
+                    "lot.patch_failed",
+                    lot_id=f"{current_lot.get('file', '')}#{current_lot.get('function', '')}",
+                    rule=current_lot.get('ruleKey', ''),
+                    error=result["error"],
+                    reason=result.get("reason", "unknown"),
+                    attempt=state.current_round + 1
+                )
                 return {
                     "patch_diff": patch_diff, 
                     "patch_applied": False,
                     "patch_error": result["error"],
-                    "patch_reason": result.get("reason", "unknown")
+                    "patch_reason": result.get("reason", "unknown"),
+                    "next_action": "STOP",
                 }
         else:
             last_resp = (self.fixer_agent.last_llm_response or "").strip()
@@ -292,15 +451,30 @@ class AutoFixPipeline:
                 logger.error("No patch generated; last LLM response:\n%s", last_resp)
             else:
                 logger.error("No patch generated; last LLM response was empty.")
+            
+            # Log falha na geração do patch
+            current_lot = state.current_lot or {}
+            log_event(
+                "lot.no_patch_generated",
+                lot_id=f"{current_lot.get('file', '')}#{current_lot.get('function', '')}",
+                rule=current_lot.get('ruleKey', ''),
+                attempt=state.current_round + 1,
+                llm_response_empty=not bool(last_resp)
+            )
+            
             return {
                 "patch_diff": "",
                 "patch_applied": False,
                 "patch_error": "No patch generated",
                 "patch_llm_response": last_resp,
+                "next_action": "STOP",
             }
     
     def tests(self, state: AgentState) -> Dict[str, Any]:
         """Run full test suite with coverage."""
+        if state.next_action == "STOP":
+            logger.info("Skipping tests due to stop request")
+            return {"next_action": "STOP"}
         # Skip tests if patch was not applied
         if not state.model_dump().get("patch_applied", True):
             logger.warning("Skipping tests - patch was not applied")
@@ -315,7 +489,8 @@ class AutoFixPipeline:
                     "stderr": "Tests skipped due to patch failure",
                     "coverage_xml_exists": False,
                     "junit_path": None
-                }
+                },
+                "next_action": state.next_action,
             }
         
         logger.info("Running full test suite with coverage")
@@ -331,11 +506,21 @@ class AutoFixPipeline:
         else:
             logger.info("All tests passed")
         
-        return {"test_report": test_report}
+        return {"test_report": test_report, "next_action": state.next_action}
     
     def sonar_rescan(self, state: AgentState) -> Dict[str, Any]:
         """Re-run SonarQube scanner."""
         logger.info("Re-scanning with SonarQube")
+        if state.next_action == "STOP":
+            logger.info("Skipping sonar rescan due to stop request")
+            return {
+                "next_action": "STOP",
+                "sonar_rescan": state.sonar_rescan or {
+                    "quality_gate": "UNKNOWN",
+                    "lot_clean": False,
+                    "total_issues": len(state.issues or [])
+                }
+            }
         
         try:
             # Run scanner with coverage
@@ -350,24 +535,33 @@ class AutoFixPipeline:
             normalized_fresh = [
                 self._normalize_issue(issue, state.repo_path) for issue in fresh_issues
             ]
+            new_hash = self._issues_hash(normalized_fresh)
+            same_as_previous = new_hash == state.prev_issue_hash
+            attempts_same = state.attempts_same_issues + 1 if same_as_previous else 0
+            stale_limit = int(os.getenv("ISSUES_STALE_LIMIT", "2"))
             
-            # Build lots keyed by rule/directory with existing budgets preserved
+            # Build lots keyed by file/function with existing budgets preserved
             existing_budgets = {
-                f"{lot['ruleKey']}#{lot['directory']}": lot.get("budget", 300)
+                f"{lot['file']}#{lot['function']}": lot.get("budget", 300)
                 for lot in (state.lots or [])
             }
             
             lots_by_key: Dict[str, Dict[str, Any]] = {}
             for issue in normalized_fresh:
                 rule_key = issue.get("rule", "unknown")
-                component = issue.get("component", "")
-                directory = str(Path(component).parent) if component else "."
-                lot_key = f"{rule_key}#{directory}"
+                component_rel = issue.get("component_rel") or issue.get("component", "")
+                if component_rel.startswith("tokens:"):
+                    component_rel = component_rel.split(":", 1)[-1]
+                directory = str(Path(component_rel).parent) if component_rel else "."
+                function_name = issue.get("function") or "__module__"
+                lot_key = f"{component_rel}#{function_name}"
                 lot_entry = lots_by_key.setdefault(
                     lot_key,
                     {
-                        "ruleKey": rule_key,
+                        "ruleKey": rule_key,  # Primeira regra encontrada
                         "directory": directory,
+                        "file": component_rel,
+                        "function": function_name,
                         "issues": [],
                         "budget": existing_budgets.get(lot_key, 300),
                     },
@@ -375,19 +569,28 @@ class AutoFixPipeline:
                 lot_entry["issues"].append(issue)
             
             ordered_keys = [
-                f"{lot['ruleKey']}#{lot['directory']}" for lot in (state.lots or [])
+                f"{lot['file']}#{lot['function']}" for lot in (state.lots or [])
             ]
             new_lots: List[Dict[str, Any]] = []
             for key in ordered_keys:
                 if key in lots_by_key:
                     new_lots.append(lots_by_key.pop(key))
-            new_lots.extend(lots_by_key.values())
+            newly_created_lots = list(lots_by_key.values())
+            if newly_created_lots:
+                for lot in newly_created_lots:
+                    log_event(
+                        "sonar.new_lot",
+                        rule=lot.get("ruleKey", ""),
+                        directory=lot.get("directory", ""),
+                        issue_count=len(lot.get("issues", [])),
+                    )
+            new_lots.extend(newly_created_lots)
             
             updated_current_lot = None
             if state.current_lot:
-                current_key = f"{state.current_lot.get('ruleKey')}#{state.current_lot.get('directory')}"
+                current_key = f"{state.current_lot.get('file')}#{state.current_lot.get('function')}"
                 for lot in new_lots:
-                    lot_key = f"{lot.get('ruleKey')}#{lot.get('directory')}"
+                    lot_key = f"{lot.get('file')}#{lot.get('function')}"
                     if lot_key == current_key:
                         updated_current_lot = lot
                         break
@@ -402,13 +605,58 @@ class AutoFixPipeline:
             
             # Check quality gate
             qg = self.sonar_client.quality_gate(state.project_key)
+            next_action = state.next_action or "continue"
+            if same_as_previous:
+                log_event("sonar.issues.unchanged", attempts=attempts_same + 1)
+            if same_as_previous and attempts_same >= stale_limit:
+                logger.warning("Issues unchanged after rescan threshold reached - stopping current lot")
+                # Log falha por issues estagnadas
+                import time
+                current_lot = state.current_lot or {}
+                
+                # Calcular tempo decorrido
+                elapsed_time = None
+                if state.lot_start_time:
+                    elapsed_time = round(time.time() - state.lot_start_time, 2)
+                
+                log_event(
+                    "lot.failed",
+                    lot_id=f"{current_lot.get('file', '')}#{current_lot.get('function', '')}",
+                    rule=current_lot.get('ruleKey', ''),
+                    status="failed_stale_issues",
+                    attempts=attempts_same,
+                    issues_count=len(current_lot.get('issues', [])),
+                    elapsed_seconds=elapsed_time,
+                    duration=self._format_duration(elapsed_time) if elapsed_time else None
+                )
+                
+                logger.warning(
+                    f"❌ Lote falhou: {current_lot.get('function', 'unknown')} "
+                    f"(issues estagnadas, {attempts_same} tentativas, "
+                    f"{self._format_duration(elapsed_time) if elapsed_time else 'N/A'})"
+                )
+                next_action = "STOP"
+            if next_action != "STOP" and not lot_issues and newly_created_lots:
+                logger.info("Current lot clean but new lots detected - scheduling next lot")
+                next_action = "next_lot"
             
             payload: Dict[str, Any] = {
                 "sonar_rescan": {
                     "quality_gate": qg.get("projectStatus", {}).get("status", "ERROR"),
                     "lot_clean": len(lot_issues) == 0,
                     "total_issues": len(normalized_fresh)
-                }
+                },
+                "prev_issue_hash": new_hash,
+                "attempts_same_issues": attempts_same,
+                "next_action": next_action,
+                "new_lots_added": [
+                    {
+                        "ruleKey": lot.get("ruleKey"),
+                        "directory": lot.get("directory"),
+                        "count": len(lot.get("issues", [])),
+                    }
+                    for lot in newly_created_lots
+                ],
             }
             payload["issues"] = normalized_fresh
             payload["lots"] = new_lots
@@ -429,16 +677,48 @@ class AutoFixPipeline:
     
     def lot_gate(self, state: AgentState) -> Dict[str, Any]:
         """Decide whether to continue, process next lot, or finish."""
+        if state.next_action == "STOP":
+            return {"next_action": "stop"}
+        if state.current_round >= state.max_rounds:
+            logger.info("Maximum rounds reached for current lot - stopping")
+            return {"next_action": "stop"}
         sonar_rescan = state.sonar_rescan
         ok_gate = sonar_rescan.get("quality_gate") == "OK"
         lot_clean = sonar_rescan.get("lot_clean", False)
         
         if ok_gate and lot_clean:
+            # Sucesso: registrar status baseado no número de tentativas
+            import time
+            current_lot = state.current_lot or {}
+            lot_status = "success_first_try" if state.current_round == 0 else f"success_retry_{state.current_round + 1}"
+            
+            # Calcular tempo decorrido
+            elapsed_time = None
+            if state.lot_start_time:
+                elapsed_time = round(time.time() - state.lot_start_time, 2)
+            
+            log_event(
+                "lot.completed",
+                lot_id=f"{current_lot.get('file', '')}#{current_lot.get('function', '')}",
+                rule=current_lot.get('ruleKey', ''),
+                status=lot_status,
+                attempts=state.current_round + 1,
+                issues_fixed=len(current_lot.get('issues', [])),
+                elapsed_seconds=elapsed_time,
+                duration=self._format_duration(elapsed_time) if elapsed_time else None
+            )
+            
+            logger.info(
+                f"✅ Lote concluído: {current_lot.get('function', 'unknown')} "
+                f"({lot_status}, {state.current_round + 1} tentativas, "
+                f"{self._format_duration(elapsed_time) if elapsed_time else 'N/A'})"
+            )
+            
             # próximo lote ou finalizar
             if state.lot_index + 1 < len(state.lots):
-                return {"next_action": "next_lot"}
+                return {"next_action": "next_lot", "lot_status": lot_status}
             else:
-                return {"next_action": "finish"}
+                return {"next_action": "finish", "lot_status": lot_status}
         
         if state.current_round + 1 < state.max_rounds:
             return {
@@ -446,11 +726,37 @@ class AutoFixPipeline:
                 "current_round": state.current_round + 1
             }
         
-        # Max rounds reached - skip to next lot or finish
+        # Max rounds reached - marcar como falha
+        import time
+        current_lot = state.current_lot or {}
+        
+        # Calcular tempo decorrido
+        elapsed_time = None
+        if state.lot_start_time:
+            elapsed_time = round(time.time() - state.lot_start_time, 2)
+        
+        log_event(
+            "lot.failed",
+            lot_id=f"{current_lot.get('file', '')}#{current_lot.get('function', '')}",
+            rule=current_lot.get('ruleKey', ''),
+            status="failed_max_attempts",
+            attempts=state.current_round + 1,
+            issues_count=len(current_lot.get('issues', [])),
+            elapsed_seconds=elapsed_time,
+            duration=self._format_duration(elapsed_time) if elapsed_time else None
+        )
+        
+        logger.warning(
+            f"❌ Lote falhou: {current_lot.get('function', 'unknown')} "
+            f"(max tentativas, {state.current_round + 1} tentativas, "
+            f"{self._format_duration(elapsed_time) if elapsed_time else 'N/A'})"
+        )
+        
+        # Skip to next lot or finish
         if state.lot_index + 1 < len(state.lots):
-            return {"next_action": "next_lot"}
+            return {"next_action": "next_lot", "lot_status": "failed_max_attempts"}
         else:
-            return {"next_action": "finish"}
+            return {"next_action": "finish", "lot_status": "failed_max_attempts"}
     
     def pr_builder(self, state: AgentState) -> Dict[str, Any]:
         """Create pull request."""
@@ -577,6 +883,47 @@ This PR automatically fixes SonarQube violations for rule `{rule_key}` in the `{
         
         return body
     
+    def _merge_rag_context(self, base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+        if not extra:
+            return base
+        merged = base or {}
+        for key in ("contexts", "few_shots", "citations"):
+            values = extra.get(key) or []
+            if not values:
+                continue
+            merged.setdefault(key, [])
+            for val in values:
+                if val not in merged[key]:
+                    merged[key].append(val)
+        if extra.get("metadata"):
+            merged.setdefault("metadata", [])
+            merged["metadata"].extend(extra["metadata"])
+        return merged
+    
+    def _issue_path_and_line(self, issue: Dict[str, Any] | None, repo_root: str | None) -> tuple[str | None, int | None]:
+        if not issue:
+            return None, None
+        component = issue.get("component_path") or issue.get("component", "")
+        if ":" in component:
+            component = component.split(":", 1)[-1]
+        component = component.strip()
+        if not component:
+            return None, issue.get("line")
+        if component.startswith("./"):
+            component = component[2:]
+        path_obj = Path(component)
+        repo_root_path = Path(repo_root or ".").resolve()
+        full_path = path_obj if path_obj.is_absolute() else repo_root_path / path_obj
+        try:
+            relative = full_path.resolve().relative_to(repo_root_path)
+            rel_path = relative.as_posix()
+        except Exception:
+            rel_path = full_path.as_posix()
+        line = issue.get("line")
+        if not line:
+            line = issue.get("textRange", {}).get("startLine")
+        return rel_path, line
+    
     def _normalize_issue(self, issue: Dict[str, Any], repo_path: str) -> Dict[str, Any]:
         """Normalize issue with resolved paths and metadata."""
         import os
@@ -589,15 +936,58 @@ This PR automatically fixes SonarQube violations for rule `{rule_key}` in the `{
             rel_path = component
         
         component_path = os.path.normpath(os.path.join(repo_path, rel_path))
-        directory = os.path.dirname(component_path)
+        repo_root_path = Path(repo_path).resolve()
+        try:
+            component_rel = Path(component_path).resolve().relative_to(repo_root_path).as_posix()
+        except Exception:
+            component_rel = Path(component_path).as_posix()
+        directory = os.path.dirname(component_rel) if component_rel else "."
         
         # Add normalized fields
         issue["ruleKey"] = issue.get("rule", "")
         issue["type"] = issue.get("type", "CODE_SMELL")  # Bug/Vulnerability/Code_Smell
         issue["component_path"] = component_path
+        issue["component_rel"] = component_rel
         issue["dir"] = directory
         
+        line = issue.get("line")
+        if not line:
+            line = issue.get("textRange", {}).get("startLine")
+        symbol, kind, span = self._infer_issue_symbol(component_rel, line, repo_root_path)
+        if symbol:
+            issue["function"] = symbol
+        if kind:
+            issue["function_kind"] = kind
+        if span:
+            issue["function_span"] = span
+        
         return issue
+    
+    def _infer_issue_symbol(
+        self,
+        component_rel: str,
+        line: int | None,
+        repo_root_path: Path
+    ) -> tuple[str | None, str | None, tuple[int | None, int | None] | None]:
+        """Infer the function/class symbol for a given issue using the RAG index."""
+        if not component_rel:
+            return None, None, None
+        try:
+            chunks = self.retriever.code_chunks(
+                component_rel,
+                repo_root=repo_root_path,
+                line=line,
+                limit=1,
+            )
+        except Exception:
+            chunks = []
+        if not chunks:
+            return None, None, None
+        chunk = chunks[0]
+        symbol = chunk.get("symbol")
+        kind = chunk.get("kind")
+        span = (chunk.get("start_line"), chunk.get("end_line"))
+        return symbol, kind, span
     
     def _issue_stable_key(self, issue: Dict[str, Any]) -> str:
         """Build a stable identifier for deduplicating Sonar issues."""
@@ -626,22 +1016,67 @@ This PR automatically fixes SonarQube violations for rule `{rule_key}` in the `{
     
     def update_lot(self, state: AgentState) -> Dict[str, Any]:
         """Update to next lot."""
+        import time
         new_index = state.lot_index + 1
         if new_index < len(state.lots):
             new_lot = state.lots[new_index]
-            logger.info(f"Moving to lot {new_index}: {new_lot.get('ruleKey', 'unknown')}")
+            logger.info(f"Moving to lot {new_index}: {new_lot.get('ruleKey', 'unknown')} [{new_lot.get('file', '')}.{new_lot.get('function', '')}]")
+            start_time = time.time()
+            log_event(
+                "lot.started",
+                lot_id=f"{new_lot.get('file', '')}#{new_lot.get('function', '')}",
+                rule=new_lot.get('ruleKey', ''),
+                issues_count=len(new_lot.get('issues', [])),
+                lot_index=new_index
+            )
+            
             return {
                 "lot_index": new_index,
                 "current_lot": new_lot,
-                "current_round": 0
+                "current_round": 0,
+                "fallback_tried": False,
+                "next_action": "continue",
+                "prev_issue_hash": self._issues_hash(new_lot.get("issues", [])),
+                "attempts_same_issues": 0,
+                "lot_start_time": start_time,
             }
         return {}
     
+    def _format_duration(self, seconds: float) -> str:
+        """Format duration in human readable format."""
+        if seconds < 60:
+            return f"{seconds:.1f}s"
+        elif seconds < 3600:
+            return f"{seconds/60:.1f}m"
+        else:
+            return f"{seconds/3600:.1f}h"
+    
+    def _log_pipeline_summary(self, result: Dict[str, Any]) -> None:
+        """Log summary of lot processing results."""
+        # Esta função seria chamada após o pipeline para resumir resultados
+        # Por enquanto, apenas log básico - pode ser expandido para ler logs estruturados
+        lots_processed = len(result.get('lots', []))
+        pr_count = len(result.get('pr_urls', []))
+        
+        log_event(
+            "pipeline.summary",
+            lots_total=lots_processed,
+            prs_created=pr_count,
+            success_rate=f"{pr_count}/{lots_processed}" if lots_processed > 0 else "0/0"
+        )
+        
+        logger.info(
+            f"Pipeline Summary: {lots_processed} lotes processados, {pr_count} PRs criados"
+        )
+    
     def _should_continue(self, state: AgentState) -> str:
         """Determine next step based on lot gate status."""
-        if state.next_action == "retry":
+        action = state.next_action
+        if action == "STOP":
+            return "stop"
+        if action == "retry":
             return "continue"
-        if state.next_action == "next_lot":
+        if action == "next_lot":
             # Update lot index and current lot
             new_index = state.lot_index + 1
             if new_index < len(state.lots):

@@ -1,0 +1,35 @@
+stateDiagram-v2
+    [*] --> sonar_ingest
+
+    state "Sonar Ingest\n(SonarQubeClient)" as sonar_ingest
+    state "Planner\n(LangGraph)" as planner
+    state "Regra + Contexto\n(RAGRetriever)" as rule_rag
+    state "Especificação de Propriedades\n(PropertyAgent)" as prop_spec
+    state "Geração de Testes\n(PropertyAgent)" as prop_gen
+    state "Execução de Propriedades\n(TesterAgent)" as prop_run
+    state "Plano de Correção\n(FixerAgent)" as fix_plan
+    state "Aplicação de Patch\n(SafePatcher)" as patch
+    state "Suite Completa\n(TesterAgent)" as tests
+    state "Rescan\n(SonarQubeClient)" as sonar_rescan
+    state "Lote / Controle\n(LangGraph)" as lot_gate
+    state "Avançar Lote\n(LangGraph)" as update_lot
+    state "PR Builder\n(LangGraph)" as pr_builder
+
+    sonar_ingest --> planner
+    planner --> rule_rag
+    rule_rag --> prop_spec
+    prop_spec --> prop_gen
+    prop_gen --> prop_run
+    prop_run --> fix_plan
+    fix_plan --> patch
+    patch --> tests
+    tests --> sonar_rescan
+    sonar_rescan --> lot_gate
+
+    lot_gate --> rule_rag: retry (teste/sonar falhou; reutiliza props/testes)
+    lot_gate --> update_lot: next_lot (lote limpo)
+    lot_gate --> pr_builder: finish (último lote ok)
+    lot_gate --> [*]: stop (limite/erro)
+
+    update_lot --> rule_rag
+    pr_builder --> [*]

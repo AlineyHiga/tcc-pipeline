@@ -116,6 +116,23 @@ class SafePatcher:
             phase_errors["apply"] = result.stderr
             
             if result.returncode == 0:
+                # Validate Python syntax after applying patch
+                syntax_errors = self._validate_python_syntax(affected_files, repo_path)
+                if syntax_errors:
+                    # Rollback the patch
+                    subprocess.run(
+                        ["git", "checkout", "--"] + affected_files,
+                        cwd=repo_path,
+                        capture_output=True
+                    )
+                    return {
+                        "applied": False,
+                        "files_changed": 0,
+                        "rejected": [],
+                        "error": f"Patch creates syntax errors: {syntax_errors}",
+                        "reason": "syntax_error"
+                    }
+                
                 return {
                     "applied": True,
                     "files_changed": len(affected_files),
@@ -198,6 +215,29 @@ class SafePatcher:
                         logger.debug(f"  {i:2d} | {line.rstrip()}")
                 except Exception as e:
                     logger.debug(f"Could not read {file_path}: {e}")
+    
+    def _validate_python_syntax(self, affected_files: List[str], repo_path: Path) -> List[str]:
+        """Validate Python syntax for affected .py files."""
+        import ast
+        syntax_errors = []
+        
+        for file_path in affected_files:
+            if not file_path.endswith('.py'):
+                continue
+                
+            full_path = repo_path / file_path
+            if not full_path.exists():
+                continue
+                
+            try:
+                content = full_path.read_text(encoding='utf-8')
+                ast.parse(content)
+            except SyntaxError as e:
+                syntax_errors.append(f"{file_path}:{e.lineno}: {e.msg}")
+            except Exception as e:
+                syntax_errors.append(f"{file_path}: {str(e)}")
+        
+        return syntax_errors
     
     def _is_path_allowed(self, path: str) -> bool:
         """Check if path is in allowlist."""

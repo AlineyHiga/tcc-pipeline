@@ -1,0 +1,36 @@
+flowchart LR
+    Start([START])
+
+    subgraph SonarQube_Utils["SonarQube & Utils"]
+        sonar["Sonar Ingest<br/>(SonarQubeClient)"]
+        rescan["Rescan<br/>(SonarQubeClient)"]
+    end
+
+    subgraph Orchestrator["LangGraph Orchestrator"]
+        plan["Planner<br/>(StateGraph)"]
+        gate["Lot Gate<br/>(StateGraph)"]
+        update["Update Lot<br/>(StateGraph)"]
+        pr["PR Builder<br/>(StateGraph)"]
+    end
+
+    subgraph RAG_LLM["RAG & LLM Agents"]
+        rule["Contexto de Regra<br/>(RAGRetriever)"]
+        spec["Prop Spec<br/>(PropertyAgent)"]
+        gen["Prop Gen<br/>(PropertyAgent)"]
+        fixplan["Fix Plan<br/>(FixerAgent)"]
+    end
+
+    subgraph Testing["Testing & QA"]
+        prop["Property Run<br/>(TesterAgent)"]
+        tests["Full Suite<br/>(TesterAgent)"]
+    end
+
+    subgraph Patching["Fixer & SafePatcher"]
+        patch["Aplicar Patch<br/>(SafePatcher)"]
+    end
+
+    Start --> sonar --> plan --> rule --> spec --> gen --> prop --> fixplan --> patch --> tests --> rescan --> gate
+    gate -->|continue| rule
+    gate -->|next_lot| update --> rule
+    gate -->|finish| pr
+    gate -->|stop| End([END])

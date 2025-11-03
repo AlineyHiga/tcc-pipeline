@@ -1,7 +1,8 @@
 """RAG ingestion for code and documentation."""
-import os
+import ast
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterable
 
 import chromadb
 try:
@@ -41,43 +42,36 @@ class RAGIngestor:
             patterns = ["*.py", "*.md", "*.txt", "*.yml", "*.yaml"]
         
         docs_indexed = 0
+        repo_root = directory.resolve()
         
         for pattern in patterns:
             for file_path in directory.rglob(pattern):
                 if self._should_skip(file_path):
                     continue
-                    
+                
                 try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
+                    rel_path = self._make_relative(file_path, repo_root)
+                    content = file_path.read_text(encoding="utf-8")
+                    self.collection.delete(where={"source": rel_path})
                     
-                    # Use text splitter if available, otherwise simple chunking
-                    if self.text_splitter:
-                        chunks = self.text_splitter.split_text(content)
-                    else:
-                        chunks = [content[i:i+1000] for i in range(0, len(content), 800)]
+                    segments = self._segment_file(file_path, rel_path, content)
+                    if not segments:
+                        continue
                     
-                    for i, chunk in enumerate(chunks):
-                        doc_id = f"{file_path}#{i}"
+                    for segment in segments:
                         self.collection.add(
-                            documents=[chunk],
-                            metadatas=[{
-                                "source": str(file_path),
-                                "chunk_id": i,
-                                "file_type": file_path.suffix
-                            }],
-                            ids=[doc_id]
+                            documents=[segment["document"]],
+                            metadatas=[segment["metadata"]],
+                            ids=[segment["id"]],
                         )
                     
-                    docs_indexed += len(chunks)
-                    
+                    docs_indexed += len(segments)
                 except Exception as e:
                     print(f"Error ingesting {file_path}: {e}")
         
         return {"docs_indexed": docs_indexed}
     
     def _should_skip(self, file_path: Path) -> bool:
-        """Check if file should be skipped during ingestion."""
         skip_dirs = {".git", "__pycache__", ".pytest_cache", "node_modules", ".venv"}
         skip_files = {".pyc", ".pyo", ".pyd"}
         
@@ -86,5 +80,126 @@ class RAGIngestor:
         
         if file_path.suffix in skip_files:
             return True
-            
+        
         return False
+    
+    def _segment_file(self, file_path: Path, rel_path: str, content: str) -> List[Dict[str, Any]]:
+        suffix = file_path.suffix.lower()
+        if suffix == ".py":
+            segments = self._segment_python(rel_path, content)
+            if segments:
+                return segments
+        return self._segment_generic(rel_path, content, suffix)
+    
+    def _segment_python(self, rel_path: str, content: str) -> List[Dict[str, Any]]:
+        segments: List[Dict[str, Any]] = []
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return segments
+        
+        for node, qualified, kind in self._iter_python_symbols(tree):
+            segment = self._node_source(content, node)
+            if not segment.strip():
+                continue
+            start = getattr(node, "lineno", 1)
+            end = getattr(node, "end_lineno", start)
+            metadata = {
+                "source": rel_path,
+                "symbol": qualified,
+                "kind": kind,
+                "start_line": start,
+                "end_line": end,
+                "file_type": ".py",
+            }
+            segments.append(
+                {
+                    "document": segment[:2500],
+                    "metadata": metadata,
+                    "id": self._build_id(rel_path, qualified, start, end),
+                }
+            )
+        
+        if segments:
+            full_meta = {
+                "source": rel_path,
+                "symbol": "__file__",
+                "kind": "file",
+                "start_line": 1,
+                "end_line": content.count("\n") + 1,
+                "file_type": ".py",
+            }
+            segments.append(
+                {
+                    "document": content[:4000],
+                    "metadata": full_meta,
+                    "id": self._build_id(rel_path, "__file__", 1, full_meta["end_line"]),
+                }
+            )
+        
+        return segments
+    
+    def _segment_generic(self, rel_path: str, content: str, suffix: str) -> List[Dict[str, Any]]:
+        chunks: Iterable[str]
+        if self.text_splitter:
+            chunks = self.text_splitter.split_text(content)
+        else:
+            step = 800
+            chunks = [content[i:i + 1000] for i in range(0, len(content), step)]
+        
+        segments: List[Dict[str, Any]] = []
+        for idx, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            metadata = {
+                "source": rel_path,
+                "symbol": f"chunk_{idx}",
+                "kind": "document",
+                "start_line": idx * 80 + 1,
+                "end_line": (idx + 1) * 80,
+                "file_type": suffix,
+            }
+            segments.append(
+                {
+                    "document": chunk,
+                    "metadata": metadata,
+                    "id": self._build_id(rel_path, metadata["symbol"], metadata["start_line"], metadata["end_line"]),
+                }
+            )
+        return segments
+    
+    def _iter_python_symbols(self, tree: ast.AST) -> Iterable[tuple]:
+        def walk(node: ast.AST, parents: List[str]) -> Iterable[tuple]:
+            for child in getattr(node, "body", []):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qualified = ".".join(parents + [child.name]) if parents else child.name
+                    kind = "method" if parents else "function"
+                    yield child, qualified, kind
+                if isinstance(child, ast.ClassDef):
+                    qualified = ".".join(parents + [child.name]) if parents else child.name
+                    yield child, qualified, "class"
+                    yield from walk(child, parents + [child.name])
+        yield from walk(tree, [])
+    
+    def _node_source(self, content: str, node: ast.AST) -> str:
+        try:
+            segment = ast.get_source_segment(content, node)
+            if segment:
+                return segment
+        except AttributeError:
+            pass
+        lines = content.splitlines()
+        start = getattr(node, "lineno", 1) - 1
+        end = getattr(node, "end_lineno", start + 1)
+        return "\n".join(lines[start:end])
+    
+    def _build_id(self, rel_path: str, symbol: str, start: int, end: int) -> str:
+        payload = f"{rel_path}:{symbol}:{start}:{end}"
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+    
+    def _make_relative(self, path: Path, repo_root: Path) -> str:
+        try:
+            rel = path.resolve().relative_to(repo_root)
+        except ValueError:
+            rel = path.name
+        return rel.as_posix()
